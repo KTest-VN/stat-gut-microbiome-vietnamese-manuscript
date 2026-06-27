@@ -21,7 +21,7 @@ Shotgun metagenomic analysis of gut microbiome from 29 apparently healthy urban 
 │   ├── 02_alpha_diversity.Rmd            # Richness, Shannon, Pielou evenness, rarefaction
 │   ├── 03_beta_diversity_aitchison.Rmd   # Aitchison distance, PERMANOVA, PCoA plot
 │   ├── 04_core_microbiome.Rmd            # Core species, prevalence thresholds, boxplots
-│   ├── 05_taxa_LEfSe.Rmd     		  # LEfSe analysis for taxa, LDA scores
+│   ├── 05_taxa_LEfSe.Rmd     		        # LEfSe analysis for taxa, LDA scores
 │   ├── 06_cooccurrence_network.Rmd       # SparCC bootstrap co-occurrence networks
 │   ├── 07_pathway_heatmap.Rmd            # Heatmap of HUMAnN3 MetaCyc pathways
 │   ├── 08_pathway_LEfSe.Rmd              # LEfSe analysis for pathways, LDA scores
@@ -41,15 +41,14 @@ Shotgun metagenomic analysis of gut microbiome from 29 apparently healthy urban 
 
 Raw sequencing data are deposited at NCBI under BioProject PRJNA1438977.
 
-Input data files required (place in `data/` directory):
+Sample input data files (place in `data/` directory):
 
 | File | Description | Sheet(s) used |
 |------|-------------|---------------|
-| `species_abundance.xlsx` | MetaPhlAn3 species-level profiles | `species_relabund`, `species_counts` |
+| `species_abundance.xlsx` | MetaPhlAn3 species-level profiles | `species_relabund`, `species_counts`, `species_counts_transpose` |
 | `metadata.xlsx` | Sample metadata (anonymized) | `metadata` |
 | `pathway_abundance.xlsx` | HUMAnN3 MetaCyc pathway abundance (CPM) | `pathway_cpm` |
-| `gmwi2_scores.xlsx` | GMWI2 scores across populations | `gmwi2` |
-| `taxa_pathway_abundance.xlsx` | Abundance at multiple taxonomic/pathway levels | `abundance` |
+| `gmwi2_scores.xlsx` | GMWI2 scores across populations | `gmwi2`, `gmwi2_taxa` |
 | `hack_taxa_list.xlsx` | HACK taxa reference list | Sheet 1 |
 
 > **Note**: Raw sequencing data are not included in this repository.
@@ -73,8 +72,7 @@ install.packages(c(
 # Bioconductor
 if (!require("BiocManager")) install.packages("BiocManager")
 BiocManager::install(c(
-  "phyloseq", "DESeq2", "microbiomeMarker",
-  "DirichletMultinomial", "indicspecies"
+  "phyloseq", "microbiomeMarker"
 ))
 
 # GitHub
