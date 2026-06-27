@@ -2,7 +2,7 @@
 
 This repository contains the R analysis code for the manuscript:
 
-> **"Taxonomic and Functional Profiling of Gut Microbiome from a Cohort of Urban Healthy Vietnamese and Health Index Assessment"**  
+> **"Taxonomic and functional profiling of gut microbiome from a cohort of urban healthy Vietnamese and health index assessment"**  
 > *Submitted to PLOS ONE*
 
 ---
@@ -104,7 +104,7 @@ rmarkdown::render("analysis/01_enterotype_clustering.Rmd")
 
 If you use this code, please cite:
 
-> Nguyen et al. Taxonomic and Functional Profiling of Gut Microbiome from a Cohort of Urban Healthy Vietnamese and Health Index Assessment. *PLOS ONE* (under review).
+> Nguyen et al. Taxonomic and functional profiling of gut microbiome from a cohort of urban healthy Vietnamese and health index assessment. *PLOS ONE* (under review).
 
 ---
 
