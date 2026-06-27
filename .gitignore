@@ -1,0 +1,26 @@
+# R
+.Rhistory
+.RData
+.Rproj.user
+*.Rproj
+
+# Output files (generated, not tracked)
+output/
+
+# Data files (sensitive / too large)
+data/*.xlsx
+data/*.csv
+data/*.tsv
+data/*.txt
+!data/README_data.md
+
+# Rendered HTML outputs
+analysis/*.html
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*~
+*.tmp
