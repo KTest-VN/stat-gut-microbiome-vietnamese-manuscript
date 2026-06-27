@@ -1,4 +1,4 @@
-# Taxonomic and Functional Profiling of Gut Microbiome from Urban Healthy Vietnamese Adults
+# Taxonomic and functional profiling of gut microbiome from a cohort of urban healthy Vietnamese and health index assessment
 
 This repository contains the R analysis code for the manuscript:
 
