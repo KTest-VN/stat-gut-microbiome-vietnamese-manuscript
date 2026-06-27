@@ -21,7 +21,7 @@ Shotgun metagenomic analysis of gut microbiome from 29 apparently healthy urban 
 │   ├── 02_alpha_diversity.Rmd            # Richness, Shannon, Pielou evenness, rarefaction
 │   ├── 03_beta_diversity_aitchison.Rmd   # Aitchison distance, PERMANOVA, PCoA plot
 │   ├── 04_core_microbiome.Rmd            # Core species, prevalence thresholds, boxplots
-│   ├── 05_taxa_LEfSe.Rmd     		        # LEfSe analysis for taxa, LDA scores
+│   ├── 05_taxa_LEfSe.Rmd     		       # LEfSe analysis for taxa, LDA scores
 │   ├── 06_cooccurrence_network.Rmd       # SparCC bootstrap co-occurrence networks
 │   ├── 07_pathway_heatmap.Rmd            # Heatmap of HUMAnN3 MetaCyc pathways
 │   ├── 08_pathway_LEfSe.Rmd              # LEfSe analysis for pathways, LDA scores
