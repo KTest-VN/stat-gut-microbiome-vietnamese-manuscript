@@ -1,0 +1,162 @@
+---
+title: "Differential Abundance Analysis — LEfSe"
+author: "Vy Nguyen"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+params:
+  run_name:   "HGM_study"
+  output_dir: "output"
+  lda_cutoff: 2.0
+  pval_cutoff: 0.05
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+library(phyloseq)
+library(microbiomeMarker)
+library(readxl)
+library(dplyr)
+library(tibble)
+library(ggplot2)
+library(openxlsx)
+library(here)
+
+run_name   <- params$run_name
+output_dir <- params$output_dir
+lda_cutoff <- params$lda_cutoff
+pval_cutoff <- params$pval_cutoff
+prefix     <- paste0(run_name, "_")
+
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+## 1. Load Data and Build Phyloseq Object
+
+```{r load-data}
+# Relative abundance (rows: species, columns: samples)
+otu_data <- read_excel(here("data", "species_abundance.xlsx"),
+                       sheet = "species_relabund")
+otu_matrix <- as.matrix(otu_data[, -1])
+rownames(otu_matrix) <- otu_data[[1]]
+
+# Metadata
+metadata <- read_excel(here("data", "metadata.xlsx"), sheet = "metadata")
+metadata <- as.data.frame(metadata)
+rownames(metadata) <- metadata$SampleID
+
+# Align samples
+common_samples <- intersect(colnames(otu_matrix), rownames(metadata))
+otu_clean      <- otu_matrix[, common_samples]
+meta_clean     <- metadata[common_samples, ]
+meta_clean$Enterotype <- as.factor(meta_clean$Enterotype)
+
+cat("Samples:", ncol(otu_clean), "\n")
+cat("Species:", nrow(otu_clean), "\n")
+cat("Enterotype distribution:\n")
+print(table(meta_clean$Enterotype))
+
+# Build phyloseq
+ps <- phyloseq(
+  otu_table(otu_clean, taxa_are_rows = TRUE),
+  sample_data(meta_clean)
+)
+
+# Filter: prevalence >= 10%, mean abundance >= 0.01%
+ps_filtered <- filter_taxa(ps, function(x) {
+  sum(x > 0) / length(x) >= 0.10 & mean(x) >= 0.0001
+}, TRUE)
+
+cat("\nAfter filtering:", ntaxa(ps_filtered), "species retained\n")
+```
+
+## 2. LEfSe Analysis
+
+```{r lefse, warning=FALSE}
+# Clean taxa names (remove special characters that break LEfSe internals)
+ps_lefse <- ps_filtered
+original_names <- taxa_names(ps_lefse)
+cleaned_names  <- gsub("[|\\[\\]\\.\\-:]", "_", original_names)
+taxa_names(ps_lefse) <- cleaned_names
+
+# Add minimal taxonomy table required by microbiomeMarker
+tax_mat <- matrix(taxa_names(ps_lefse), nrow = ntaxa(ps_lefse), ncol = 1)
+rownames(tax_mat) <- taxa_names(ps_lefse)
+colnames(tax_mat) <- "Species"
+tax_table(ps_lefse) <- tax_table(tax_mat)
+
+sample_data(ps_lefse)$Enterotype <- droplevels(sample_data(ps_lefse)$Enterotype)
+
+cat("Running LEfSe...\n")
+lefse_result <- run_lefse(
+  ps_lefse,
+  group         = "Enterotype",
+  taxa_rank     = "Species",
+  wilcoxon_cutoff = pval_cutoff,
+  lda_cutoff    = lda_cutoff,
+  norm          = "CPM"
+)
+
+# Extract marker table
+marker_tbl <- marker_table(lefse_result)
+
+# Add FDR correction (manual, FDR method)
+marker_tbl$p_adjust <- p.adjust(marker_tbl$pvalue, method = "fdr")
+
+# Restore original taxa names
+name_map <- setNames(original_names, cleaned_names)
+marker_tbl$feature <- name_map[marker_tbl$feature]
+
+cat("Biomarkers identified:", nrow(marker_tbl), "\n")
+print(marker_tbl)
+```
+
+## 3. Export Results
+
+```{r export}
+# Split by enterotype
+results_list <- list(All_Markers = as.data.frame(marker_tbl))
+
+for (grp in unique(marker_tbl$enrich_group)) {
+  results_list[[paste0("Markers_", grp)]] <- marker_tbl %>%
+    filter(enrich_group == grp) %>%
+    arrange(desc(abs(ef_lda))) %>%
+    as.data.frame()
+}
+
+# Summary stats per group
+results_list[["Summary"]] <- marker_tbl %>%
+  group_by(enrich_group) %>%
+  summarise(N_markers   = n(),
+            Mean_LDA    = mean(abs(ef_lda)),
+            Median_LDA  = median(abs(ef_lda)),
+            Max_LDA     = max(abs(ef_lda)),
+            .groups = "drop") %>%
+  as.data.frame()
+
+write.xlsx(results_list,
+           file.path(output_dir, paste0(prefix, "LEfSe_results.xlsx")))
+
+cat("Results exported.\n")
+```
+
+## 4. Visualizations
+
+```{r plot-bar, fig.width=10, fig.height=7}
+# Standard LEfSe bar plot
+tryCatch({
+  p_bar <- plot_ef_bar(lefse_result)
+  print(p_bar)
+  ggsave(file.path(output_dir, paste0(prefix, "LEfSe_barplot.png")),
+         p_bar, width = 10, height = max(6, nrow(marker_tbl) * 0.25), dpi = 300)
+}, error = function(e) cat("plot_ef_bar failed:", e$message, "\n"))
+```
+
+## Session Info
+
+```{r session-info}
+cat("Output saved to:", output_dir, "\n")
+sessionInfo()
+```

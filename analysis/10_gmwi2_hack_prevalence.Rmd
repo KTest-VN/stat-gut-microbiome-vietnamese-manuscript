@@ -1,0 +1,257 @@
+---
+title: "HACK Taxa Prevalence across GMWI2 Quartiles"
+author: "Vy Nguyen"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+params:
+  run_name:   "HGM_study"
+  output_dir: "output"
+---
+
+> Examines the prevalence of HACK (Health-Associated Core Keystone, Goel et al. 2025) 
+> species across GMWI2 quartiles (Q1–Q4). Statistical comparison focuses on Q1 vs Q4  
+> using Fisher's exact test with Benjamini-Hochberg FDR correction.
+
+```{r setup, message=FALSE, warning=FALSE}
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(pheatmap)
+library(RColorBrewer)
+library(knitr)
+library(kableExtra)
+library(writexl)
+library(tibble)
+library(here)
+
+run_name   <- params$run_name
+output_dir <- params$output_dir
+prefix     <- paste0(run_name, "_")
+
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+## 1. Load Data
+
+```{r load-data}
+# Metadata with GMWI2 scores
+metadata <- read_excel(here("data", "metadata.xlsx"), sheet = "metadata")
+colnames(metadata) <- trimws(colnames(metadata))
+
+# Species abundance at species level
+species_abun <- read_excel(here("data", "taxa_pathway_abundance.xlsx"),
+                            sheet = "abundance")
+
+# HACK taxa reference list (Goel et al. 2025)
+hacklist <- read_excel(here("data", "hack_taxa_list.xlsx"))
+
+cat("Metadata samples:", nrow(metadata), "\n")
+cat("Species in abundance file:", nrow(species_abun), "\n")
+cat("HACK taxa:", nrow(hacklist), "\n")
+```
+
+## 2. Assign GMWI2 Quartiles
+
+```{r quartiles}
+metadata <- metadata %>%
+  mutate(GMWI2_Quartile = cut(GMWI2,
+                               breaks        = quantile(GMWI2, probs = 0:4/4,
+                                                         na.rm = TRUE),
+                               labels        = c("Q1", "Q2", "Q3", "Q4"),
+                               include.lowest = TRUE))
+
+quartile_summary <- metadata %>%
+  group_by(GMWI2_Quartile) %>%
+  summarise(N        = n(),
+            GMWI2_min = min(GMWI2, na.rm = TRUE),
+            GMWI2_max = max(GMWI2, na.rm = TRUE),
+            .groups  = "drop")
+
+kable(quartile_summary, digits = 4,
+      caption = "GMWI2 Quartile Distribution") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"))
+```
+
+## 3. Calculate Prevalence by Quartile
+
+```{r prevalence}
+merged <- species_abun %>%
+  left_join(metadata %>% select(SampleID, GMWI2, GMWI2_Quartile),
+            by = "SampleID")
+
+species_cols <- colnames(species_abun)[colnames(species_abun) != "SampleID"]
+
+# Prevalence per species per quartile
+calc_prevalence <- function(species_name, data, cols) {
+  col <- cols[grepl(gsub(" ", "_", species_name), cols, fixed = TRUE)]
+  if (length(col) == 0) return(NULL)
+
+  data %>%
+    group_by(GMWI2_Quartile) %>%
+    summarise(
+      Total      = n(),
+      Present    = sum(.data[[col[1]]] > 0, na.rm = TRUE),
+      Prevalence = Present / Total * 100,
+      .groups    = "drop"
+    ) %>%
+    mutate(Species = species_name) %>%
+    select(Species, GMWI2_Quartile, Prevalence, Present, Total)
+}
+
+prev_list <- lapply(hacklist$Species, calc_prevalence,
+                    data = merged, cols = species_cols)
+prev_data <- bind_rows(prev_list)
+
+prev_wide <- prev_data %>%
+  select(Species, GMWI2_Quartile, Prevalence) %>%
+  pivot_wider(names_from = GMWI2_Quartile, values_from = Prevalence)
+
+kable(prev_wide, digits = 1,
+      caption = "Prevalence (%) of HACK Species by GMWI2 Quartile") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+## 4. Fisher's Exact Test — Q1 vs Q4
+
+```{r fisher-test}
+fisher_test <- function(species_name, data, cols) {
+  col <- cols[grepl(gsub(" ", "_", species_name), cols, fixed = TRUE)]
+  if (length(col) == 0) return(NULL)
+
+  q1 <- data %>% filter(GMWI2_Quartile == "Q1")
+  q4 <- data %>% filter(GMWI2_Quartile == "Q4")
+
+  q1_pos <- sum(q1[[col[1]]] > 0, na.rm = TRUE)
+  q4_pos <- sum(q4[[col[1]]] > 0, na.rm = TRUE)
+  ct     <- matrix(c(q1_pos, nrow(q1) - q1_pos,
+                     q4_pos, nrow(q4) - q4_pos),
+                   nrow = 2, byrow = TRUE)
+  ft <- fisher.test(ct)
+
+  data.frame(
+    Species       = species_name,
+    Q1_Prevalence = q1_pos / nrow(q1) * 100,
+    Q1_Count      = paste0(q1_pos, "/", nrow(q1)),
+    Q4_Prevalence = q4_pos / nrow(q4) * 100,
+    Q4_Count      = paste0(q4_pos, "/", nrow(q4)),
+    Difference    = q4_pos / nrow(q4) * 100 - q1_pos / nrow(q1) * 100,
+    Odds_Ratio    = ft$estimate,
+    P_value       = ft$p.value
+  )
+}
+
+stats_df <- bind_rows(lapply(hacklist$Species, fisher_test,
+                              data = merged, cols = species_cols)) %>%
+  mutate(FDR          = p.adjust(P_value, method = "BH"),
+         Significance = case_when(FDR < 0.001 ~ "***",
+                                   FDR < 0.01  ~ "**",
+                                   FDR < 0.05  ~ "*",
+                                   TRUE        ~ "ns")) %>%
+  arrange(P_value)
+
+cat("Significant HACK taxa (FDR < 0.05):", sum(stats_df$FDR < 0.05), "\n")
+kable(stats_df, digits = 4,
+      caption = "Fisher's Exact Test: Q1 vs Q4") %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  row_spec(which(stats_df$FDR < 0.05), bold = TRUE, background = "#ffffcc")
+```
+
+## 5. Visualizations
+
+```{r heatmap, fig.width=10, fig.height=8}
+hm_data <- prev_wide %>%
+  column_to_rownames("Species") %>%
+  as.matrix()
+
+png(file.path(output_dir, paste0(prefix, "HACK_prevalence_heatmap.png")),
+    width = 3000, height = 2500, res = 300)
+pheatmap(hm_data,
+         cluster_rows   = FALSE,
+         cluster_cols   = FALSE,
+         display_numbers = TRUE,
+         number_format  = "%.1f",
+         number_color = "black",
+         color          = colorRampPalette(c("#d92727", "#f2e288", "#006400"))(100),
+         breaks         = seq(0, 100, length.out = 101),
+         main           = "Prevalence (%) of 17 HACK Species across GMWI2 Quartiles",
+	 angle_col = 0,
+         fontsize        = 11,
+         cellwidth       = 80,
+         cellheight      = 25,
+         border_color    = "white")
+dev.off()
+```
+
+```{r barplot-q1q4, fig.width=12, fig.height=8}
+bar_data <- stats_df %>%
+  select(Species, Q1_Prevalence, Q4_Prevalence, P_value, FDR, Significance) %>%
+  arrange(desc(P_value)) %>%  # Sort by p-value (smallest at bottom = top in plot)
+  mutate(Species = factor(Species, levels = Species)) %>%
+  pivot_longer(cols = c(Q1_Prevalence, Q4_Prevalence),
+               names_to = "Group", values_to = "Prevalence") %>%
+  mutate(Group = recode(Group,
+                        Q1_Prevalence = "Q1",
+                        Q4_Prevalence = "Q4"))
+
+p_bar <- ggplot(bar_data, aes(x = Prevalence, y = Species, fill = Group)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.7),
+           width = 0.65, color = "black", size = 0.5) +
+  scale_fill_manual(values = c("Q1"  = "#5DADE2",
+                               "Q4" = "#EC7063")) +
+  scale_x_continuous(breaks = seq(0, 100, 20), limits = c(0, 115)) +
+  labs(title    = "Prevalence of 17 HACK Species in Q1 vs Q4",
+       subtitle = "Sorted by P-value: most significant on top",
+       x = "Prevalence (%)", y = "Species", fill = "GMWI2 Group") +
+  theme_classic(base_size = 12) +
+  theme(
+    plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = 13, hjust = 0.5),
+    axis.text.y = element_text(size = 11),
+    axis.text.x = element_text(size = 11),
+    axis.title = element_text(size = 13, face = "bold"),
+    legend.position = c(0.93, 0.1),
+    legend.background = element_rect(fill = "white", color = "black"),
+    legend.title = element_text(face = "bold"),
+    panel.grid.major.x = element_line(color = "grey90", linetype = "dashed")
+  ) +
+  scale_x_continuous(breaks = seq(0, 100, 20), limits = c(0, 110))
+
+# Add significance markers
+sig_unique <- stats_df %>%
+  filter(P_value < 0.05) %>%
+  select(Species, Significance)
+
+p_bar_sig <- p_bar +
+  geom_text(data = sig_unique,
+            aes(x = -2, y = Species, label = Significance),
+            inherit.aes = FALSE,
+            hjust = 1, vjust = 0.5,
+	    color = "red", fontface = "bold", size = 4)
+
+print(p_bar_sig)
+ggsave(file.path(output_dir, paste0(prefix, "HACK_Q1_vs_Q4_barplot.png")),
+       p_bar_sig, width = 10, height = 6, dpi = 300)
+```
+
+## 6. Export
+
+```{r export}
+write_xlsx(list(
+  Prevalence_by_Quartile = prev_wide,
+  Q1_vs_Q4_Statistics    = stats_df,
+  Sample_Quartile_Assign = metadata %>% select(SampleID, GMWI2, GMWI2_Quartile)
+), file.path(output_dir, paste0(prefix, "HACK_prevalence_results.xlsx")))
+
+cat("Results exported.\n")
+```
+
+## Session Info
+
+```{r session-info}
+sessionInfo()
+```

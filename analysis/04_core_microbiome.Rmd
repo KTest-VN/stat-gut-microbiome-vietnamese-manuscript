@@ -1,0 +1,221 @@
+---
+title: "Core Microbiome Analysis"
+author: "Vy Nguyen"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+params:
+  run_name:          "HGM_study"
+  output_dir:        "output"
+  prevalence_cutoff: 0.70    # minimum fraction of samples a species must appear in
+  abundance_cutoff:  0.10    # minimum relative abundance (%) to count as present
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(stringr)
+library(openxlsx)
+library(here)
+
+run_name          <- params$run_name
+output_dir        <- params$output_dir
+prevalence_cutoff <- params$prevalence_cutoff
+abundance_cutoff  <- params$abundance_cutoff
+prefix            <- paste0(run_name, "_")
+
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+
+cat("Prevalence cutoff:", prevalence_cutoff,
+    "| Abundance cutoff:", abundance_cutoff, "%\n")
+```
+
+## 1. Load Data
+
+```{r load-data}
+dat          <- read_excel(here("data", "species_abundance.xlsx"),
+                           sheet = "species_relabund")
+species_names <- dat[[1]]
+abundance_mat <- as.matrix(dat[, -1])
+sample_names  <- colnames(abundance_mat)
+
+cat("Species:", nrow(dat), "| Samples:", ncol(abundance_mat), "\n")
+```
+
+## 2. Core Species Identification
+
+```{r core-species}
+# Presence/absence matrix at given abundance cutoff
+presence_mat <- (abundance_mat >= abundance_cutoff) * 1
+
+# Prevalence per species
+prevalence       <- rowMeans(presence_mat)
+prevalence_table <- data.frame(Species    = species_names,
+                                Prevalence = round(prevalence, 3))
+
+# Core species: prevalence >= cutoff, exclude unclassified
+core_idx        <- which(prevalence >= prevalence_cutoff)
+core_species    <- species_names[core_idx]
+core_species    <- core_species[!grepl("unclassified", core_species, ignore.case = TRUE)]
+core_prevalence <- prevalence[match(core_species, species_names)]
+core_table      <- data.frame(Species    = core_species,
+                               Prevalence = round(core_prevalence, 3)) %>%
+                   arrange(desc(Prevalence))
+
+cat("Core species identified:", nrow(core_table), "\n")
+print(core_table)
+
+# Export
+write.xlsx(list(
+  Abundance_Matrix    = data.frame(Species = species_names, abundance_mat),
+  Presence_Absence    = data.frame(Species = species_names, presence_mat),
+  Prevalence_All      = prevalence_table,
+  Core_Species        = core_table
+), file.path(output_dir, paste0(prefix, "core_microbiome_tables.xlsx")))
+```
+
+## 3. Boxplot — Core Species Abundance Distribution
+
+```{r boxplot-core, fig.width=10, fig.height=8}
+# Filter to core species only
+core_data <- dat %>%
+  filter(!!sym(names(dat)[1]) %in% core_table$Species)
+
+core_long <- core_data %>%
+  tidyr::pivot_longer(-1, names_to = "Sample", values_to = "Abundance") %>%
+  dplyr::rename(Species = 1)
+
+core_long$Species <- factor(core_long$Species, 
+                            levels = core_table$Species)
+
+# Summary statistics per species
+core_wide <- core_long %>%
+  pivot_wider(names_from = Sample, values_from = Abundance)
+writexl::write_xlsx(core_wide, path = file.path(output_dir, paste0(prefix, "boxplot_core_wide.xlsx")))
+
+summary_core <- core_long %>%
+  group_by(Species) %>%
+  summarise(
+    Mean       = mean(Abundance, na.rm = TRUE),
+    Median     = median(Abundance, na.rm = TRUE),
+    SD         = sd(Abundance, na.rm = TRUE),
+    Prevalence = core_table$Prevalence[match(first(as.character(Species)),
+                                             core_table$Species)],
+    .groups = "drop"
+  )
+write.xlsx(summary_core,
+           file.path(output_dir, paste0(prefix, "core_species_summary.xlsx")),
+           rowNames = FALSE)
+
+# Horizontal boxplot (log10 scale)
+p_box <- ggplot(core_long, aes(x = Abundance, y = Species)) +
+  geom_boxplot(fill = "#98c8e2", color = "#1c5d81",
+               outlier.shape = NA, width = 0.6) +
+  geom_jitter(width = 0, height = 0.13, size = 1,
+              color = "gray30", alpha = 0.7) +
+  scale_x_log10(breaks = c(0.01, 0.1, 1, 10, 100),
+                labels = c("0.01", "0.10", "1.00", "10.00", "100.00")) +
+  scale_y_discrete(limits = rev(levels(core_long$Species))) +
+  labs(x     = "Relative Abundance (%) [log10 scale]",
+       y     = "Species",
+       title = "Distribution of Core Gut Microbiome Species") +
+  theme_bw(base_size = 13) +
+  theme(
+    plot.title  = element_text(size = 20, face = "bold", hjust = 0.5),
+    axis.title.x = element_text(size = 15, face = "bold"),
+    axis.text.y = element_text(size = 15, face = "bold")
+    axis.text.x = element_text(size = 12),
+    axis.text.y = element_text(size = 12, face = "italic")
+  )
+
+print(p_box)
+ggsave(file.path(output_dir, paste0(prefix, "core_microbiome_boxplot.png")),
+       p_box, width = 10, height = 8, dpi = 300)
+```
+
+## 4. Stability Analysis — Threshold Sensitivity
+
+```{r stability-single, fig.width=8, fig.height=6}
+# Show how core species count changes with prevalence threshold
+thresholds  <- seq(0.1, 1.0, by = 0.01)
+core_counts <- sapply(thresholds, function(th) {
+  candidates <- species_names[prevalence >= th]
+  sum(!grepl("unclassified", candidates, ignore.case = TRUE))
+})
+
+stability_df <- data.frame(Threshold = thresholds, CoreCount = core_counts)
+
+p_stab <- ggplot(stability_df, aes(x = Threshold, y = CoreCount)) +
+  geom_line(color = "#2c3e50", linewidth = 1) +
+  geom_point(color = "#e74c3c", size = 1.5) +
+  geom_vline(xintercept = prevalence_cutoff,
+             linetype = "dashed", color = "blue") +
+  annotate("text", x = prevalence_cutoff, y = max(core_counts) * 0.8,
+           label = paste0("Cutoff: ", prevalence_cutoff),
+           color = "blue", angle = 90, vjust = -0.5) +
+  scale_x_continuous(labels = scales::percent, breaks = seq(0, 1, 0.1)) +
+  labs(title    = "Core Microbiome Stability",
+       subtitle = "Number of core species vs prevalence threshold",
+       x = "Prevalence Threshold", y = "Number of Core Species") +
+  theme_bw()
+
+print(p_stab)
+ggsave(file.path(output_dir, paste0(prefix, "stability_prevalence.png")),
+       p_stab, width = 8, height = 6, dpi = 300)
+```
+
+```{r stability-2d, fig.width=9, fig.height=7}
+# Cross-tabulate over both abundance and prevalence thresholds
+ab_cutoffs <- c(0, 0.01, 0.1, 0.5, 1.0)
+prev_thresholds <- seq(0.1, 1.0, by = 0.1)
+
+stability_2d <- bind_rows(lapply(ab_cutoffs, function(ab) {
+  pres <- if (ab == 0) (abundance_mat > 0) * 1 else (abundance_mat >= ab) * 1
+  prev <- rowMeans(pres)
+  counts <- sapply(prev_thresholds, function(p) {
+    cands <- species_names[prev >= p]
+    sum(!grepl("unclassified", cands, ignore.case = TRUE))
+  })
+  data.frame(PrevThreshold  = prev_thresholds,
+             CoreCount       = counts,
+             AbundanceCutoff = paste0("≥", ab, "%"))
+})) %>%
+  mutate(AbundanceCutoff = factor(AbundanceCutoff,
+                                  levels = paste0("≥", ab_cutoffs, "%")))
+
+p_stab2d <- ggplot(stability_2d,
+                   aes(x = PrevThreshold, y = CoreCount, color = AbundanceCutoff)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 1.5, alpha = 0.7) +
+  scale_x_continuous(labels = scales::percent, breaks = seq(0, 1, 0.1)) +
+  scale_color_brewer(palette = "Dark2") +
+  labs(title    = "Core Microbiome Stability — Sensitivity Analysis",
+       subtitle = "Effect of abundance and prevalence filters on core species count",
+       x = "Prevalence Threshold", y = "Number of Core Species",
+       color = "Min Abundance") +
+  theme_bw() +
+  theme(legend.position = c(0.85, 0.75),
+        legend.background = element_rect(fill = "white", color = "gray"))
+
+print(p_stab2d)
+ggsave(file.path(output_dir, paste0(prefix, "stability_2d.png")),
+       p_stab2d, width = 9, height = 7, dpi = 300)
+
+write.xlsx(list(
+  Stability_Long  = stability_2d,
+  Stability_Wide  = stability_2d %>%
+                    pivot_wider(names_from = AbundanceCutoff, values_from = CoreCount)
+), file.path(output_dir, paste0(prefix, "stability_sensitivity.xlsx")))
+```
+
+## Session Info
+
+```{r session-info}
+cat("Output saved to:", output_dir, "\n")
+sessionInfo()
+```

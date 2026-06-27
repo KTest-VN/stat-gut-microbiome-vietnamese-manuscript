@@ -1,0 +1,376 @@
+---
+title: "Co-occurrence Network Analysis — SparCC Bootstrap"
+author: "Vy Nguyen"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+params:
+  run_name:       "HGM_study"
+  output_dir:     "output"
+  sparcc_iter:    50      # SparCC iterations
+  inner_iter:     20      # SparCC inner iterations
+  bootstrap_r:    500     # Bootstrap replicates (500 for publication)
+  cor_cutoff:     0.3     # Minimum absolute correlation to retain
+  pval_cutoff:    0.05    # FDR threshold
+  stab_cutoff:    0.8     # Minimum bootstrap stability
+  min_prevalence: 0.3     # Minimum prevalence for species inclusion (30%)
+---
+
+> **Note**: Networks are constructed separately per enterotype group, resulting
+> in small effective sample sizes. Results should be interpreted as exploratory.
+> Claims about hub taxa and network properties are descriptive only and require
+> independent validation in larger cohorts.
+
+```{r setup, message=FALSE, warning=FALSE}
+library(SpiecEasi)
+library(igraph)
+library(ggraph)
+library(ggplot2)
+library(dplyr)
+library(writexl)
+library(readxl)
+library(tibble)
+library(pheatmap)
+library(RColorBrewer)
+library(gridExtra)
+library(here)
+
+run_name       <- params$run_name
+output_dir     <- params$output_dir
+SPARCC_ITER    <- params$sparcc_iter
+SPARCC_INNER_ITER <- params$inner_iter
+BOOTSTRAP_R    <- params$bootstrap_r
+COR_CUTOFF     <- params$cor_cutoff
+PVAL_CUTOFF    <- params$pval_cutoff
+STAB_CUTOFF    <- params$stab_cutoff
+MIN_PREV       <- params$min_prevalence
+prefix         <- paste0(run_name, "_")
+
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+
+# Limit BLAS/OpenMP threads to avoid parallelism conflicts with sparccboot
+Sys.setenv(
+  OPENBLAS_NUM_THREADS = "1",
+  OMP_NUM_THREADS      = "1",
+  MKL_NUM_THREADS      = "1",
+  VECLIB_MAXIMUM_THREADS = "1",
+  NUMEXPR_NUM_THREADS  = "1"
+)
+if (requireNamespace("RhpcBLASctl", quietly = TRUE)) {
+  RhpcBLASctl::blas_set_num_threads(1)
+  RhpcBLASctl::omp_set_num_threads(1)
+}
+
+cat(sprintf("Parameters: Iter=%d, Bootstrap=%d, Cor_Th=%.2f, Pval_Th=%.2f, Stab_Th=%.2f\n",
+            SPARCC_ITER, BOOTSTRAP_R, COR_CUTOFF, PVAL_CUTOFF, STAB_CUTOFF))
+```
+
+## 1. Load Data
+
+```{r load-data}
+# Raw count matrix (required for SparCC)
+otu_raw_data   <- read_excel(here("data", "species_abundance.xlsx"),
+                              sheet = "species_counts_transposed")
+otu_matrix_raw <- as.matrix(otu_raw_data[, -1])
+rownames(otu_matrix_raw) <- otu_raw_data[[1]]
+otu_matrix_raw <- round(otu_matrix_raw)
+storage.mode(otu_matrix_raw) <- "integer"
+
+# Metadata
+metadata <- read_excel(here("data", "metadata.xlsx"), sheet = "metadata")
+metadata <- as.data.frame(metadata)
+rownames(metadata) <- metadata$SampleID
+
+# Align samples
+common_samples <- intersect(colnames(otu_matrix_raw), rownames(metadata))
+otu_raw_clean  <- otu_matrix_raw[, common_samples]
+meta_clean     <- metadata[common_samples, ]
+
+cat("Samples:", ncol(otu_raw_clean),
+    "| Species:", nrow(otu_raw_clean), "\n")
+cat("Enterotype distribution:\n")
+print(table(meta_clean$Enterotype))
+```
+
+## 2. Prepare SparCC Input Matrix
+
+```{r prepare-matrix}
+# Transpose raw count matrix to samples x species
+otu_mat <- t(otu_raw_clean)
+storage.mode(otu_mat) <- "integer"
+
+# Prevalence filter: retain species present in >= 30% of samples
+min_prev      <- MIN_PREV * nrow(otu_mat)
+keep_taxa     <- colSums(otu_mat > 0) >= min_prev
+otu_mat_clean <- otu_mat[, keep_taxa]
+
+cat("After prevalence filter:", ncol(otu_mat_clean), "species retained\n")
+```
+
+## 4. SparCC Analysis Function
+
+```{r sparcc-function}
+analyze_sparcc <- function(data_mat, label) {
+
+  message("\n>>> Analyzing: ", label,
+          " | Dimensions: ", paste(dim(data_mat), collapse = "x"))
+
+  if (ncol(data_mat) < 3) {
+    message("   Skipped: fewer than 3 species.")
+    return(NULL)
+  }
+
+  # Use available cores minus 2, minimum 1
+  n_cores <- max(1, parallel::detectCores() - 2)
+
+  set.seed(123)
+
+  # Run SparCC bootstrap
+  res_boot <- tryCatch(
+    sparccboot(data = data_mat,
+               R    = BOOTSTRAP_R,
+               ncpus = n_cores,
+               sparcc.params = list(iter       = SPARCC_ITER,
+                                    inner_iter  = SPARCC_INNER_ITER,
+                                    th          = 0.1)),
+    error = function(e) {
+      message("   SparCC error: ", e$message)
+      NULL
+    }
+  )
+  if (is.null(res_boot)) return(NULL)
+
+  # Extract p-values and correlations
+  res_pval   <- pval.sparccboot(res_boot)
+  cor_matrix <- res_pval$cors
+  p_matrix   <- res_pval$pvals
+
+  # Reshape if output is unexpectedly flat
+  if (is.null(dim(cor_matrix))) {
+    n_taxa     <- ncol(data_mat)
+    cor_matrix <- matrix(cor_matrix, nrow = n_taxa, ncol = n_taxa)
+    p_matrix   <- matrix(p_matrix,   nrow = n_taxa, ncol = n_taxa)
+    colnames(cor_matrix) <- rownames(cor_matrix) <- colnames(data_mat)
+    colnames(p_matrix)   <- rownames(p_matrix)   <- colnames(data_mat)
+  }
+
+  # Bootstrap stability: fraction of bootstrap replicates matching sign of observed correlation
+  cor_vec <- cor_matrix[lower.tri(cor_matrix)]
+  if (!is.null(res_boot$t) && ncol(res_boot$t) == length(cor_vec)) {
+    stability_vec <- sapply(seq_along(cor_vec), function(idx) {
+      boot_vals <- res_boot$t[, idx]
+      mean(sign(boot_vals) == sign(cor_vec[idx]), na.rm = TRUE)
+    })
+  } else {
+    message("   Warning: stability calculation skipped (dimension mismatch).")
+    stability_vec <- rep(NA, length(cor_vec))
+  }
+
+  # Build edge list from upper triangle
+  taxa_names <- colnames(data_mat)
+  edges      <- data.frame()
+  k          <- 1
+
+  for (i in seq_len(length(taxa_names) - 1)) {
+    for (j in seq(i + 1, length(taxa_names))) {
+      r_val <- cor_matrix[i, j]
+      p_raw <- p_matrix[i, j]
+      stab  <- if (k <= length(stability_vec)) stability_vec[k] else NA
+      k     <- k + 1
+
+      # Pseudo-count correction for p-values of zero
+      p_corrected <- max(p_raw, 1 / (BOOTSTRAP_R + 1))
+
+      if (!is.na(r_val) && abs(r_val) >= COR_CUTOFF) {
+        edges <- rbind(edges, data.frame(
+          from        = taxa_names[i],
+          to          = taxa_names[j],
+          weight      = r_val,
+          p_raw       = p_corrected,
+          stability   = stab,
+          group       = label,
+          stringsAsFactors = FALSE
+        ))
+      }
+    }
+  }
+
+  if (nrow(edges) == 0) {
+    message("   No edges above |r| threshold.")
+    return(NULL)
+  }
+
+  # FDR correction
+  edges$p_adj      <- p.adjust(edges$p_raw, method = "BH")
+  edges_filtered   <- edges %>%
+    filter(p_adj < PVAL_CUTOFF) %>%
+    mutate(interaction = ifelse(weight > 0, "Positive", "Negative"))
+
+  message("   Significant edges (FDR < ", PVAL_CUTOFF, "): ", nrow(edges_filtered))
+  return(edges_filtered)
+}
+```
+
+## 5. Network Plotting Function
+
+```{r network-function}
+plot_network <- function(edges_df, label) {
+
+  g <- graph_from_data_frame(edges_df, directed = FALSE)
+  if (vcount(g) > 0) g <- delete_vertices(g, which(degree(g) == 0))
+  if (vcount(g) == 0) return(NULL)
+
+  # Edge distance weight for path calculations
+  E(g)$distance <- 1 / abs(E(g)$weight)
+
+  # Node centrality metrics
+  V(g)$degree      <- degree(g)
+  V(g)$betweenness <- betweenness(g, normalized = TRUE, weights = NA)
+  V(g)$closeness   <- closeness(g, normalized = TRUE, weights = NA)
+  V(g)$eigen       <- eigen_centrality(g, weights = abs(E(g)$weight))$vector
+  V(g)$clustering_coeff <- transitivity(g, type = "local", vids = V(g))
+
+  # Community detection on positive edges only
+  g_pos  <- subgraph.edges(g, E(g)[weight > 0], delete.vertices = FALSE)
+  comm   <- cluster_louvain(g_pos, weights = E(g_pos)$weight)
+  V(g)$community <- as.factor(membership(comm))
+
+  # Hub detection: top 20th percentile for both degree and betweenness
+  V(g)$is_hub <- V(g)$degree      >= quantile(V(g)$degree, 0.80) &
+                 V(g)$betweenness >= quantile(V(g)$betweenness, 0.80)
+
+  # Global network metrics
+  num_pos  <- sum(E(g)$weight > 0)
+  num_neg  <- sum(E(g)$weight < 0)
+
+  metrics_df <- data.frame(
+    Network           = label,
+    Nodes             = vcount(g),
+    Edges             = ecount(g),
+    Pos_Edges         = num_pos,
+    Neg_Edges         = num_neg,
+    Pos_Neg_Ratio     = round(ifelse(num_neg > 0, num_pos / num_neg, num_pos), 2),
+    Density           = round(edge_density(g), 4),
+    Global_Clustering = round(transitivity(g, type = "global"), 4),
+    Avg_Clustering    = round(mean(V(g)$clustering_coeff, na.rm = TRUE), 4),
+    Modularity        = round(modularity(comm), 4),
+    Avg_Degree        = round(mean(V(g)$degree), 3),
+    Avg_Path_Len      = round(mean_distance(g, directed = FALSE, weights = NA), 3)
+  )
+
+  # Node-level table
+  nodes_df <- data.frame(
+    Species          = V(g)$name,
+    Degree           = V(g)$degree,
+    Betweenness      = round(V(g)$betweenness, 4),
+    Closeness        = round(V(g)$closeness, 4),
+    Eigenvector      = round(V(g)$eigen, 4),
+    Clustering_Coeff = round(V(g)$clustering_coeff, 4),
+    Community        = V(g)$community,
+    Is_Hub           = V(g)$is_hub,
+    Network          = label
+  ) %>% arrange(desc(Betweenness))
+
+  # Plot
+  set.seed(999)
+  lay <- layout_with_graphopt(g, charge = 0.05, spring.length = 20)
+  V(g)$label_show <- ifelse(V(g)$is_hub, V(g)$name, NA)
+
+  p <- ggraph(g, layout = lay) +
+    geom_edge_link(aes(color = interaction, width = abs(weight)), alpha = 0.5) +
+    scale_edge_color_manual(values = c("Positive" = "#3498DB",
+                                       "Negative" = "#E74C3C")) +
+    scale_edge_width(range = c(0.3, 1.5), guide = "none") +
+    geom_node_point(aes(size = degree, fill = community),
+                    shape = 21, color = "white", stroke = 0.5) +
+    scale_size(range = c(3, 10)) +
+    scale_fill_brewer(palette = "Set3") +
+    geom_node_text(aes(label = label_show),
+                   repel = TRUE, size = 3, fontface = "bold") +
+    theme_void() +
+    labs(title    = paste("Co-occurrence Network —", label),
+         subtitle = sprintf("Nodes: %d | Edges: %d (+%d/-%d) | Clustering: %.3f",
+                            vcount(g), ecount(g), num_pos, num_neg,
+                            transitivity(g, type = "global")),
+         caption  = "Labelled nodes = hub taxa (top 20th percentile: degree + betweenness)")
+
+  return(list(metrics = metrics_df, nodes = nodes_df, plot = p))
+}
+```
+
+## 6. Run Analysis
+
+```{r run-global}
+all_edges   <- list()
+all_metrics <- list()
+
+# Global network (all samples)
+e_glob <- analyze_sparcc(otu_mat_clean, "Global")
+if (!is.null(e_glob)) {
+  all_edges[["Edges_Global"]] <- e_glob
+  res <- plot_network(e_glob, "Global")
+  if (!is.null(res)) {
+    all_metrics[["Global"]]     <- res$metrics
+    all_edges[["Nodes_Global"]] <- res$nodes
+    print(res$plot)
+    ggsave(file.path(output_dir, paste0(prefix, "Global.png")),
+           res$plot, width = 12, height = 10, dpi = 300, bg = "white")
+  }
+}
+```
+
+```{r run-enterotypes}
+# Per-enterotype networks
+for (et in unique(meta_clean$Enterotype)) {
+  samps <- intersect(rownames(meta_clean)[meta_clean$Enterotype == et],
+                     rownames(otu_mat_clean))
+
+  if (length(samps) < 5) {
+    cat("Skipping", et, "— fewer than 5 samples\n")
+    next
+  }
+
+  sub_mat <- otu_mat_clean[samps, , drop = FALSE]
+  sub_mat <- sub_mat[, colSums(sub_mat) > 0, drop = FALSE]
+
+  e_et <- analyze_sparcc(sub_mat, et)
+  if (!is.null(e_et)) {
+    all_edges[[paste0("Edges_", et)]] <- e_et
+    res <- plot_network(e_et, et)
+    if (!is.null(res)) {
+      all_metrics[[et]]                  <- res$metrics
+      all_edges[[paste0("Nodes_", et)]]  <- res$nodes
+      print(res$plot)
+      ggsave(file.path(output_dir, paste0(prefix, "Network_", et, ".png")),
+             res$plot, width = 12, height = 10, dpi = 300, bg = "white")
+    }
+  }
+}
+```
+
+## 7. Export Results
+
+```{r export}
+if (length(all_metrics) > 0) {
+  network_summary <- do.call(rbind, all_metrics)
+  all_edges[["Network_Summary"]] <- network_summary
+
+  cat("\n=== Network Summary ===\n")
+  print(network_summary)
+
+  write_xlsx(all_edges,
+             file.path(output_dir, paste0(prefix, "SparCC_Results_FDR.xlsx")))
+  cat("Results exported.\n")
+} else {
+  cat("No significant networks found.\n")
+}
+```
+
+## Session Info
+
+```{r session-info}
+sessionInfo()
+```

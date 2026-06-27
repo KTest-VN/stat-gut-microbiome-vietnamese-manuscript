@@ -1,0 +1,427 @@
+---
+title: "Beta Diversity Analysis — Aitchison Distance (CLR-transformed)"
+author: "Vy Nguyen"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+params:
+  run_name: "HGM_study"
+  output_dir: "output"
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+library(readxl)
+library(vegan)
+library(cluster)
+library(dendextend)
+library(openxlsx)
+library(ggplot2)
+library(RColorBrewer)
+library(here)
+
+run_name   <- params$run_name
+output_dir <- params$output_dir
+prefix     <- paste0(run_name, "_")
+
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+---
+
+## Zero Handling Before CLR Transformation
+
+```{r zero_handling_function}
+# Multiplicative zero replacement
+# Input: matrix/dataframe where each ROW is a sample and each COL is a taxon
+# Output: zero-replaced matrix where each row still sums to 1
+multiplicative_zero_replacement <- function(x, delta = NULL) {
+  x <- as.matrix(x)
+  
+  # Normalise to proportion [0,1] if data are in percentage format (row sums ~ 100)
+  row_totals <- rowSums(x)
+  if (mean(row_totals) > 1.1) {
+    x <- x / row_totals
+    cat("  [Zero replacement] Data normalised from % to proportion (row sum = 1).\n")
+  }
+  
+  # If delta is not specified, use half the minimum non-zero value
+  if (is.null(delta)) {
+    min_nonzero <- min(x[x > 0])
+    delta <- min_nonzero / 2
+  }
+  cat("  [Zero replacement] Delta =", delta, "\n")
+  
+  # Apply row-wise (per sample)
+  x_replaced <- t(apply(x, 1, function(row) {
+    zeros    <- row == 0
+    n_zeros  <- sum(zeros)
+    
+    if (n_zeros == 0) return(row)
+    
+    row_new         <- row
+    row_new[zeros]  <- delta
+    # Rescale non-zero values so row sum remains 1
+    scale_factor    <- (1 - n_zeros * delta)
+    row_new[!zeros] <- row[!zeros] * scale_factor
+    
+    return(row_new)
+  }))
+  
+  return(x_replaced)
+}
+
+# CLR transformation
+# Input: zero-replaced matrix (no zeros present)
+clr_transform <- function(x) {
+  x <- as.matrix(x)
+  t(apply(x, 1, function(row) {
+    log(row) - mean(log(row))
+  }))
+}
+```
+
+---
+
+## Input Data
+
+```{r input_data}
+file_xlsx <- here("data", "species_abundance.xlsx")
+df0 <- as.data.frame(read_excel(file_xlsx, sheet = "species_relabund"))
+
+rownames(df0) <- df0[[1]]
+df <- as.data.frame(df0[, -1])
+df[] <- lapply(df, as.numeric)
+df  <- t(df)   # rows = samples, cols = species
+
+cat("Samples:", nrow(df), "\n")
+cat("Species:", ncol(df), "\n")
+cat("Zero count in data:", sum(df == 0), 
+    sprintf("(%.1f%%)\n", 100 * mean(df == 0)))
+cat("Min non-zero value:", min(df[df > 0]), "\n")
+```
+
+---
+
+## CLR Transformation and Aitchison Distance
+
+```{r aitchison_distance}
+# 1. Zero replacement
+df_replaced <- multiplicative_zero_replacement(df)
+
+cat("Post zero-replacement check:\n")
+cat("  Any zeros remaining:", any(df_replaced == 0), "\n")
+cat("  Row sums (first 5 samples):", round(rowSums(df_replaced)[1:5], 6), "\n")
+
+# 2. CLR transformation
+df_clr <- clr_transform(df_replaced)
+rownames(df_clr) <- rownames(df)
+colnames(df_clr) <- colnames(df)
+
+cat("\nCLR transformation:\n")
+cat("  Dimensions:", dim(df_clr), "\n")
+cat("  Row means ≈ 0 (check, first 5 samples):", 
+    round(rowMeans(df_clr)[1:5], 8), "\n")
+
+# 3. Aitchison distance = Euclidean distance on CLR-transformed data
+aitchison_dist <- dist(df_clr, method = "euclidean")
+
+# Export distance matrix
+aitchison_matrix <- as.matrix(aitchison_dist)
+write.xlsx(aitchison_matrix,
+           file = file.path(output_dir, paste0(prefix, "aitchison_matrix.xlsx")),
+           rowNames = TRUE)
+
+cat("\nAitchison distance matrix exported.\n")
+cat("Range:", round(range(aitchison_dist), 3), "\n")
+```
+
+---
+
+## Export Intermediate Files
+
+```{r export_clr_crosscheck}
+wb_check <- createWorkbook()
+
+# Sheet 1: Raw abundance (original input)
+addWorksheet(wb_check, "1_raw_abundance")
+writeData(wb_check, "1_raw_abundance",
+          cbind(SampleID = rownames(df), as.data.frame(df)))
+
+# Sheet 2: After zero replacement
+addWorksheet(wb_check, "2_zero_replaced")
+writeData(wb_check, "2_zero_replaced",
+          cbind(SampleID = rownames(df_replaced), as.data.frame(df_replaced)))
+
+# Sheet 3: Row sum check after replacement (expected = 1)
+row_sums <- rowSums(df_replaced)
+addWorksheet(wb_check, "3_rowsums_check")
+writeData(wb_check, "3_rowsums_check",
+          data.frame(SampleID = rownames(df_replaced),
+                     RowSum    = round(row_sums, 8),
+                     OK        = abs(row_sums - 1) < 1e-6))
+
+# Sheet 4: CLR-transformed values
+addWorksheet(wb_check, "4_clr_transformed")
+writeData(wb_check, "4_clr_transformed",
+          cbind(SampleID = rownames(df_clr), as.data.frame(df_clr)))
+
+# Sheet 5: Row mean check after CLR (expected ≈ 0)
+row_means <- rowMeans(df_clr)
+addWorksheet(wb_check, "5_rowmeans_check")
+writeData(wb_check, "5_rowmeans_check",
+          data.frame(SampleID = rownames(df_clr),
+                     RowMean   = round(row_means, 8),
+                     OK        = abs(row_means) < 1e-6))
+
+# Sheet 6: Aitchison distance matrix
+addWorksheet(wb_check, "6_aitchison_distance")
+writeData(wb_check, "6_aitchison_distance",
+          cbind(SampleID = rownames(aitchison_matrix),
+                as.data.frame(aitchison_matrix)))
+
+# Save workbook
+crosscheck_path <- file.path(output_dir, paste0(prefix, "CLR_crosscheck.xlsx"))
+saveWorkbook(wb_check, crosscheck_path, overwrite = TRUE)
+
+# Quick summary
+cat("======= CROSS-CHECK SUMMARY =======\n")
+cat("Sheet 1 | Raw abundance  — row sums:\n")
+cat("  Min:", round(min(rowSums(df)), 4),
+    "| Max:", round(max(rowSums(df)), 4),
+    "  (expected: all = 1)\n")
+cat("Sheet 2 | Zero-replaced  — row sums:\n")
+cat("  Min:", round(min(row_sums), 8),
+    "| Max:", round(max(row_sums), 8),
+    "  (expected: all = 1)\n")
+cat("  Any zeros remaining:", any(df_replaced == 0), "\n")
+cat("Sheet 4 | CLR-transformed — row means:\n")
+cat("  Min:", round(min(row_means), 8),
+    "| Max:", round(max(row_means), 8),
+    "  (expected: all ≈ 0)\n")
+cat("Sheet 6 | Aitchison dist  — diagonal:\n")
+diag_vals <- diag(aitchison_matrix)
+cat("  Diagonal:", round(min(diag_vals), 8), "–", round(max(diag_vals), 8),
+    "  (expected: all = 0)\n")
+cat("  Off-diagonal range:",
+    round(min(aitchison_matrix[lower.tri(aitchison_matrix)]), 3), "–",
+    round(max(aitchison_matrix[lower.tri(aitchison_matrix)]), 3), "\n")
+cat("File saved:", crosscheck_path, "\n")
+cat("====================================\n")
+```
+
+---
+
+## Load Metadata
+
+```{r load_metadata}
+metadata <- read_excel(here("data", "metadata.xlsx"), sheet = "metadata")
+colnames(metadata)[1] <- "SampleID"
+metadata$Enterotype <- as.factor(metadata$Enterotype)
+
+metadata_ordered <- metadata[match(rownames(df_clr), metadata$SampleID), ]
+
+cat("Samples:", nrow(metadata_ordered), "\n")
+cat("Enterotypes:", levels(metadata_ordered$Enterotype), "\n")
+print(table(metadata_ordered$Enterotype))
+```
+
+---
+
+## PERMANOVA with Aitchison Distance
+
+```{r permanova_aitchison}
+# PERMANOVA on Aitchison distance
+# Note: no need to specify method = "euclidean" in adonis2 since
+# a pre-computed distance object is passed directly
+set.seed(123)
+permanova_result <- adonis2(aitchison_dist ~ Enterotype,
+                            data = metadata_ordered,
+                            permutations = 999)
+
+cat("\n=== PERMANOVA (Aitchison Distance) ===\n")
+print(permanova_result)
+
+cat("\nInterpretation:\n")
+cat("- R² =", round(permanova_result$R2[1], 4),
+    ": proportion of variance explained by Enterotype\n")
+cat("- p-value =", permanova_result$`Pr(>F)`[1], "\n")
+if (permanova_result$`Pr(>F)`[1] < 0.05) {
+  cat("=> Significant difference in community composition between enterotypes (p < 0.05)\n")
+} else {
+  cat("=> No significant difference in community composition (p >= 0.05)\n")
+}
+```
+
+---
+
+## Homogeneity of Dispersion Test (Betadisper)
+
+```{r betadisper}
+betadisper_result <- betadisper(aitchison_dist, metadata_ordered$Enterotype)
+
+cat("\n=== Betadisper (Aitchison) ===\n")
+print(betadisper_result)
+
+anova_betadisper <- anova(betadisper_result)
+print(anova_betadisper)
+
+set.seed(123)
+perm_betadisper <- permutest(betadisper_result, pairwise = TRUE, permutations = 999)
+print(perm_betadisper)
+
+cat("\nInterpretation:\n")
+p_disp <- perm_betadisper$tab$`Pr(>F)`[1]
+if (p_disp < 0.05) {
+  cat("- p =", round(p_disp, 4), "< 0.05: Significant dispersion heterogeneity between enterotypes\n")
+  cat("  → Interpret PERMANOVA with caution (result may reflect both centroid and dispersion differences)\n")
+} else {
+  cat("- p =", round(p_disp, 4), ">= 0.05: Homogeneous dispersion between enterotypes\n")
+  cat("  → PERMANOVA result reflects true centroid differences\n")
+}
+
+png(file.path(output_dir, paste0(prefix, "betadisper_aitchison_boxplot.png")),
+    width = 7, height = 6, units = "in", res = 300)
+boxplot(betadisper_result, main = "Distance to Centroid (Aitchison)")
+dev.off()
+```
+
+---
+
+## PCoA with Aitchison Distance
+
+```{r pcoa_aitchison}
+pcoa_res <- cmdscale(aitchison_dist, k = 2, eig = TRUE)
+pcoa_points <- as.data.frame(pcoa_res$points)
+colnames(pcoa_points) <- c("PCoA1", "PCoA2")
+pcoa_points$SampleID <- rownames(pcoa_points)
+
+eig_vals <- pcoa_res$eig
+var_exp  <- eig_vals[1:2] / sum(eig_vals[eig_vals > 0]) * 100
+xlab_pcoa <- sprintf("PCoA1 (%.1f%%)", var_exp[1])
+ylab_pcoa <- sprintf("PCoA2 (%.1f%%)", var_exp[2])
+
+plot_df <- merge(pcoa_points, metadata, by = "SampleID")
+
+subtitle_text <- sprintf(
+  "PERMANOVA: R² = %.3f, p = %.3f | Betadisper p = %.3f",
+  permanova_result$R2[1],
+  permanova_result$`Pr(>F)`[1],
+  p_disp
+)
+
+# Basic plot
+p_basic <- ggplot(plot_df, aes(x = PCoA1, y = PCoA2, color = Enterotype)) +
+  geom_point(size = 3, alpha = 0.8) +
+  labs(
+    title    = "PCoA - Aitchison Distance (CLR-transformed)",
+    subtitle = subtitle_text,
+    x = xlab_pcoa,
+    y = ylab_pcoa,
+    color = "Enterotype"
+  ) +
+  theme_bw(base_size = 14) +
+  theme(panel.grid.minor = element_blank(),
+        legend.position  = "right")
+
+print(p_basic)
+
+# Plot with 95% confidence ellipses
+p_ellipse <- p_basic +
+  stat_ellipse(aes(group = Enterotype, color = Enterotype),
+               level = 0.95, type = "t", linetype = 2)
+print(p_ellipse)
+
+# Plot with sample labels
+p_with_labels <- p_ellipse +
+  geom_text(aes(label = SampleID), vjust = -0.5, size = 2.5, show.legend = FALSE)
+print(p_with_labels)
+
+# Save workbook
+ggsave(file.path(output_dir, paste0(prefix, "PCoA_aitchison_basic.png")),
+       p_basic, width = 8, height = 6, dpi = 300)
+ggsave(file.path(output_dir, paste0(prefix, "PCoA_aitchison_ellipse.png")),
+       p_ellipse, width = 8, height = 6, dpi = 300)
+ggsave(file.path(output_dir, paste0(prefix, "PCoA_aitchison_ellipse_ID.png")),
+       p_with_labels, width = 9, height = 7, dpi = 300)
+
+cat("PCoA plots saved.\n")
+```
+
+---
+
+## Pairwise PERMANOVA (if > 2 groups)
+
+```{r pairwise_permanova}
+if (length(levels(metadata_ordered$Enterotype)) > 2) {
+  groups <- levels(metadata_ordered$Enterotype)
+  pairwise_results <- data.frame(
+    Comparison  = character(),
+    R2          = numeric(),
+    F_statistic = numeric(),
+    p_value     = numeric(),
+    stringsAsFactors = FALSE
+  )
+
+  for (i in 1:(length(groups) - 1)) {
+    for (j in (i + 1):length(groups)) {
+      idx      <- metadata_ordered$Enterotype %in% c(groups[i], groups[j])
+      sub_dist <- as.dist(as.matrix(aitchison_dist)[idx, idx])
+      sub_meta <- metadata_ordered[idx, ]
+      set.seed(123)
+      sub_perm <- adonis2(sub_dist ~ Enterotype, data = sub_meta, permutations = 999)
+      pairwise_results <- rbind(pairwise_results, data.frame(
+        Comparison  = paste(groups[i], "vs", groups[j]),
+        R2          = sub_perm$R2[1],
+        F_statistic = sub_perm$F[1],
+        p_value     = sub_perm$`Pr(>F)`[1]
+      ))
+    }
+  }
+
+  pairwise_results$p_adjusted <- p.adjust(pairwise_results$p_value, method = "BH")
+  cat("\n=== Pairwise PERMANOVA (Aitchison) ===\n")
+  print(pairwise_results)
+  write.xlsx(pairwise_results,
+             file = file.path(output_dir, paste0(prefix, "pairwise_PERMANOVA_aitchison.xlsx")))
+} else {
+  cat("Only 2 enterotypes — pairwise comparison not required.\n")
+}
+```
+
+---
+
+## Summary Report
+
+```{r summary}
+summary_stats <- data.frame(
+  Test       = c("PERMANOVA (Aitchison)", "Betadisper (Aitchison)"),
+  Distance   = c("Aitchison (CLR + Euclidean)", "Aitchison (CLR + Euclidean)"),
+  Statistic  = c(
+    sprintf("R² = %.4f, F = %.4f", permanova_result$R2[1], permanova_result$F[1]),
+    sprintf("F = %.4f", anova_betadisper$`F value`[1])
+  ),
+  p_value    = c(
+    permanova_result$`Pr(>F)`[1],
+    anova_betadisper$`Pr(>F)`[1]
+  ),
+  Significant = c(
+    ifelse(permanova_result$`Pr(>F)`[1] < 0.05, "Yes", "No"),
+    ifelse(anova_betadisper$`Pr(>F)`[1] < 0.05, "Yes", "No")
+  )
+)
+
+cat("\n=== SUMMARY ===\n")
+print(summary_stats)
+
+write.xlsx(summary_stats,
+           file = file.path(output_dir, paste0(prefix, "statistical_summary_aitchison.xlsx")))
+```
+
+## Session Info
+
+```{r session_info}
+sessionInfo()
+```

@@ -1,0 +1,280 @@
+---
+title: "Enterotype Clustering Analysis"
+author: "Vy Nguyen"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+params:
+  run_name: "HGM_study"
+  output_dir: "output"
+---
+
+```{r setup, include=TRUE, message=FALSE, warning=FALSE}
+library(readxl)
+library(tidyverse)
+library(philentropy)
+library(cluster)
+library(fpc)
+library(DirichletMultinomial)
+library(factoextra)
+library(pheatmap)
+library(openxlsx)
+library(ggplot2)
+library(RColorBrewer)
+library(reshape2)
+library(vegan)
+library(dendextend)
+library(pairwiseAdonis)
+library(here)
+
+# Parameters
+run_name   <- params$run_name
+output_dir <- params$output_dir
+prefix     <- paste0(run_name, "_")
+
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+cat("Output directory:", output_dir, "\n")
+```
+
+## 1. Load Data
+
+```{r load-data}
+# Species relative abundance (rows: species, columns: samples)
+df <- read_excel(here("data", "species_abundance.xlsx"), sheet = "species_relabund")
+
+# Aggregate relative abundance to genus level
+df$genus <- gsub("s__([^_]+)_.*", "g__\\1", df$clade_name)
+df$genus <- ifelse(grepl("^g__", df$clade_name), df$clade_name, df$genus)
+
+df_genus <- df %>%
+  select(-clade_name) %>%
+  group_by(genus) %>%
+  summarise(across(everything(), sum, na.rm = TRUE))
+
+write.xlsx(df_genus,
+           file.path(output_dir, paste0(prefix, "abundance_by_genus.xlsx")),
+           rowNames = FALSE)
+
+# Build sample x genus matrix
+mat <- t(as.matrix(df_genus[, -1]))
+colnames(mat) <- df_genus$genus
+rownames(mat) <- colnames(df_genus)[-1]
+mat[is.na(mat)] <- 0
+
+cat("Samples:", nrow(mat), "\n")
+cat("Genera:", ncol(mat), "\n")
+```
+
+## 2. PAM Clustering (Jensen-Shannon Distance)
+
+```{r pam-clustering}
+set.seed(2024)
+
+# Compute Jensen-Shannon distance
+jsd_matrix <- distance(mat, method = "jensen-shannon", mute.message = TRUE)
+jsd_dist   <- as.dist(jsd_matrix)
+
+# Evaluate k = 2:5 using silhouette width and Calinski-Harabasz index
+sil_width  <- c()
+ch_index   <- c()
+pam_results <- list()
+
+for (k in 2:5) {
+  set.seed(2024)
+  pam_fit      <- pam(jsd_dist, k = k)
+  sil_width[k] <- pam_fit$silinfo$avg.width
+  ch_index[k]  <- calinhara(mat, pam_fit$clustering)
+  pam_results[[k]] <- pam_fit
+}
+
+# Select optimal k
+optimal_k     <- which.max(sil_width)
+optimal_k_ch  <- which.max(ch_index)
+pam_final     <- pam_results[[optimal_k]]
+pam_cluster   <- pam_final$clustering
+
+cat("Optimal k (silhouette):", optimal_k, "\n")
+cat("Optimal k (CH index):", optimal_k_ch, "\n")
+
+# Clustering evaluation summary
+eval_df <- data.frame(
+  k              = 2:5,
+  Silhouette     = sil_width[2:5],
+  CH_index       = ch_index[2:5]
+)
+print(eval_df)
+
+final_eval_df <- data.frame(
+  Optimal_k                = optimal_k,
+  Average_Silhouette_Score = pam_final$silinfo$avg.width,
+  Interpretation           = ifelse(pam_final$silinfo$avg.width > 0.70, "Strong structure",
+                             ifelse(pam_final$silinfo$avg.width > 0.50, "Reasonable structure",
+                             ifelse(pam_final$silinfo$avg.width > 0.25, "Weak structure",
+                                    "No substantial structure")))
+)
+
+write.xlsx(list(Evaluation_by_k  = eval_df,
+               Final_Summary     = final_eval_df),
+           file.path(output_dir, paste0(prefix, "PAM_evaluation_summary.xlsx")),
+           rowNames = FALSE)
+
+# Assign enterotype labels based on dominant genus
+pam_genus_summary <- lapply(1:optimal_k, function(i) {
+  grp     <- mat[pam_cluster == i, , drop = FALSE]
+  mean_ab <- colMeans(grp)
+  sort(mean_ab, decreasing = TRUE)[1:10]
+})
+
+genus_names <- sapply(1:optimal_k, function(i) {
+  top_genus  <- names(pam_genus_summary[[i]])[1]
+  paste0(gsub("g__", "", top_genus), "-type")
+})
+
+pam_et_tbl <- data.frame(
+  SampleID      = rownames(mat),
+  Enterotype_PAM = genus_names[pam_cluster]
+)
+
+write.xlsx(pam_et_tbl,
+           file.path(output_dir, paste0(prefix, "enterotype_PAM.xlsx")),
+           rowNames = FALSE)
+
+cat("Enterotype distribution (PAM):\n")
+print(table(pam_et_tbl$Enterotype_PAM))
+```
+
+## 3. Stacked Barplot — Mean Genus Abundance per Enterotype (PAM)
+
+```{r stacked-barplot-pam}
+mat_long <- melt(
+  as.data.frame(mat) %>% tibble::rownames_to_column("SampleID"),
+  id.vars = "SampleID", variable.name = "Genus", value.name = "Abundance"
+) %>% left_join(pam_et_tbl, by = "SampleID")
+
+plot_data_pam <- mat_long %>%
+  group_by(Enterotype_PAM, Genus) %>%
+  summarise(MeanAbundance = mean(Abundance), .groups = "drop") %>%
+  group_by(Enterotype_PAM) %>%
+  mutate(RelAbund = MeanAbundance / sum(MeanAbundance))
+
+top10_pam <- plot_data_pam %>%
+  group_by(Genus) %>%
+  summarise(Sum = sum(RelAbund), .groups = "drop") %>%
+  slice_max(order_by = Sum, n = 10) %>%
+  pull(Genus)
+
+p_bar_pam <- ggplot(filter(plot_data_pam, Genus %in% top10_pam),
+                    aes(x = Enterotype_PAM, y = RelAbund, fill = Genus)) +
+  geom_bar(stat = "identity", position = "stack") +
+  theme_minimal(base_size = 13) +
+  labs(title = "Mean Genus Abundance by Enterotype (PAM)",
+       x = "Enterotype", y = "Mean Relative Abundance") +
+  scale_fill_brewer(palette = "Paired")
+
+print(p_bar_pam)
+ggsave(file.path(output_dir, paste0(prefix, "barplot_genus_by_enterotype_PAM.png")),
+       p_bar_pam, width = 7, height = 5, dpi = 300)
+
+write.xlsx(filter(plot_data_pam, Genus %in% top10_pam),
+           file.path(output_dir, paste0(prefix, "barplot_genus_PAM_top10.xlsx")),
+           rowNames = FALSE)
+```
+
+## 4. PCoA — Bray-Curtis, Coloured by Enterotype
+
+```{r pcoa-bray-pam}
+# Compute Bray-Curtis distance
+bray_dist   <- vegdist(mat, method = "bray")
+bray_matrix <- as.matrix(bray_dist)
+write.xlsx(bray_matrix,
+           file.path(output_dir, paste0(prefix, "braycurtis_distance_matrix.xlsx")),
+           rowNames = TRUE)
+
+# PCoA
+pcoa_res    <- cmdscale(bray_dist, k = 2, eig = TRUE)
+pcoa_points <- as.data.frame(pcoa_res$points)
+colnames(pcoa_points) <- c("PCoA1", "PCoA2")
+pcoa_points$SampleID  <- rownames(pcoa_points)
+
+eig_vals  <- pcoa_res$eig
+var_exp   <- eig_vals[1:2] / sum(eig_vals[eig_vals > 0]) * 100
+xlab_pcoa <- sprintf("PCoA1 (%.1f%%)", var_exp[1])
+ylab_pcoa <- sprintf("PCoA2 (%.1f%%)", var_exp[2])
+
+# PAM
+plot_df_pam <- merge(pcoa_points, pam_et_tbl, by = "SampleID")
+
+p_pcoa_pam <- ggplot(plot_df_pam,
+                     aes(x = PCoA1, y = PCoA2, color = Enterotype_PAM)) +
+  geom_point(size = 3, alpha = 0.9) +
+  labs(title = "PCoA (Bray-Curtis) — PAM Enterotypes",
+       x = xlab_pcoa, y = ylab_pcoa, color = "Enterotype") +
+  theme_bw(base_size = 14) +
+  theme(panel.grid = element_blank())
+
+print(p_pcoa_pam)
+ggsave(file.path(output_dir, paste0(prefix, "PCoA_BrayCurtis_PAM.png")),
+       p_pcoa_pam, width = 7, height = 6, dpi = 300)
+ggsave(file.path(output_dir, paste0(prefix, "PCoA_BrayCurtis_PAM_labels.png")),
+       p_pcoa_pam + geom_text(aes(label = SampleID), vjust = -0.5, size = 2),
+       width = 7, height = 6, dpi = 300)
+```
+
+```{r pcoa-jsd-pam}
+# PCoA on JSD distance — PAM
+pcoa_jsd    <- cmdscale(jsd_dist, k = 2, eig = TRUE)
+pcoa_jsd_df <- as.data.frame(pcoa_jsd$points)
+colnames(pcoa_jsd_df) <- c("PCoA1", "PCoA2")
+pcoa_jsd_df$SampleID  <- rownames(mat)
+
+eig_jsd   <- pcoa_jsd$eig
+var_jsd   <- eig_jsd[1:2] / sum(eig_jsd[eig_jsd > 0]) * 100
+
+plot_jsd_pam <- merge(pcoa_jsd_df, pam_et_tbl, by = "SampleID")
+
+p_pcoa_jsd <- ggplot(plot_jsd_pam,
+                     aes(x = PCoA1, y = PCoA2, color = Enterotype_PAM)) +
+  geom_point(size = 3, alpha = 0.9) +
+  labs(title = "PCoA (Jensen-Shannon) — PAM Enterotypes",
+       x = sprintf("PCoA1 (%.1f%%)", var_jsd[1]),
+       y = sprintf("PCoA2 (%.1f%%)", var_jsd[2]),
+       color = "Enterotype") +
+  theme_bw(base_size = 14) +
+  theme(panel.grid = element_blank())
+
+print(p_pcoa_jsd)
+ggsave(file.path(output_dir, paste0(prefix, "PCoA_JSD_PAM.png")),
+       p_pcoa_jsd, width = 7, height = 6, dpi = 300)
+```
+
+## 5. PERMANOVA and Betadisper
+
+```{r permanova}
+# Homogeneity of dispersion — PAM
+disp_pam <- betadisper(bray_dist, group = pam_et_tbl$Enterotype_PAM)
+permutest(disp_pam, pairwise = TRUE)
+
+# PERMANOVA — PAM
+adonis_pam <- adonis2(bray_dist ~ Enterotype_PAM,
+                      data = pam_et_tbl, permutations = 999)
+print(adonis_pam)
+
+# Pairwise PERMANOVA — PAM (if > 2 enterotypes)
+if (length(unique(pam_et_tbl$Enterotype_PAM)) > 2) {
+  pw_pam <- pairwise.adonis(mat, factors = pam_et_tbl$Enterotype_PAM,
+                             sim.method = "bray", p.adjust.m = "fdr")
+  print(pw_pam)
+  write.xlsx(pw_pam,
+             file.path(output_dir, paste0(prefix, "pairwise_PERMANOVA_PAM.xlsx")))
+}
+
+```
+
+## Session Info
+
+```{r session-info}
+sessionInfo()
+```

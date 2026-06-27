@@ -1,0 +1,172 @@
+---
+title: "GMWI2 Distribution and Cross-Population Comparison"
+author: "Vy Nguyen"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+params:
+  run_name:       "HGM_study"
+  output_dir:     "output"
+  this_study_label: "This study"   # substring to identify the study cohort in Population column
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+library(readxl)
+library(dplyr)
+library(ggplot2)
+library(writexl)
+library(car)
+library(rstatix)
+library(ggpubr)
+library(forcats)
+library(here)
+
+run_name          <- params$run_name
+output_dir        <- params$output_dir
+this_study_label  <- params$this_study_label
+prefix            <- paste0(run_name, "_")
+
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+## 1. Load Data
+
+```{r load-data}
+df <- read_excel(here("data", "gmwi2_scores.xlsx"), sheet = "gmwi2")
+head(df)
+
+# Reorder: study cohort first
+target_name <- grep(this_study_label, unique(df$Population),
+                    value = TRUE, ignore.case = TRUE)
+
+if (length(target_name) > 0) {
+  df$Population <- fct_relevel(df$Population, target_name)
+  cat("Reference population placed first:", target_name, "\n")
+} else {
+  warning("No population matching '", this_study_label, "' found.")
+}
+
+cat("Populations:", paste(levels(df$Population), collapse = ", "), "\n")
+cat("Total samples:", nrow(df), "\n")
+```
+
+## 2. Descriptive Statistics
+
+```{r descriptive}
+stats <- df %>%
+  group_by(Population) %>%
+  summarise(
+    N        = n(),
+    Mean     = mean(GMWI2, na.rm = TRUE),
+    SD       = sd(GMWI2, na.rm = TRUE),
+    Median   = median(GMWI2, na.rm = TRUE),
+    Q1       = quantile(GMWI2, 0.25, na.rm = TRUE),
+    Q3       = quantile(GMWI2, 0.75, na.rm = TRUE),
+    Min      = min(GMWI2, na.rm = TRUE),
+    Max      = max(GMWI2, na.rm = TRUE),
+    variance = var(`GMWI2`, na.rm = TRUE),
+    coef_var = SD / Mean,
+    .groups  = "drop"
+  )
+
+knitr::kable(stats, digits = 3,
+             caption = "Descriptive Statistics of GMWI2 by Population")
+write_xlsx(stats,
+           file.path(output_dir, paste0(prefix, "GMWI2_descriptive_stats.xlsx")))
+```
+
+## 3. Boxplot
+
+```{r boxplot, fig.width=8, fig.height=6}
+p_box <- ggplot(df, aes(x = Population, y = GMWI2, fill = Population)) +
+  geom_boxplot(outlier.shape = 21, alpha = 0.8) +
+  geom_jitter(width = 0.15, alpha = 0.5, size = 1.5) +
+  labs(title = "Distribution of GMWI2 Across Populations",
+       x = "Population", y = "GMWI2 Score") +
+  theme_bw(base_size = 12) +
+  theme(legend.position  = "none",
+        plot.title       = element_text(face = "bold", hjust = 0.5),
+        axis.text.x      = element_text(angle = 45, hjust = 1))
+
+print(p_box)
+ggsave(file.path(output_dir, paste0(prefix, "GMWI2_boxplot_by_population.png")),
+       p_box, width = 7, height = 6, dpi = 300)
+```
+
+## 4. Statistical Testing
+
+```{r stats-test}
+# Normality (Shapiro-Wilk per group)
+normality_test <- df %>%
+  group_by(Population) %>%
+  shapiro_test(GMWI2)
+knitr::kable(normality_test, digits = 4,
+             caption = "Shapiro-Wilk Normality Test")
+
+# Levene's test
+levene_result <- leveneTest(GMWI2 ~ Population, data = df)
+cat("Levene's test p-value:", levene_result$`Pr(>F)`[1], "\n")
+
+all_normal   <- all(normality_test$p > 0.05)
+homogeneous  <- levene_result$`Pr(>F)`[1] > 0.05
+
+if (all_normal && homogeneous) {
+  # ANOVA
+  anova_result <- aov(GMWI2 ~ Population, data = df)
+  cat("\nUsing: One-way ANOVA\n")
+  print(summary(anova_result))
+
+  tukey        <- TukeyHSD(anova_result)
+  posthoc_df   <- as.data.frame(tukey$Population)
+  write_xlsx(posthoc_df,
+             file.path(output_dir, paste0(prefix, "GMWI2_ANOVA_Tukey.xlsx")))
+  pairwise_results <- posthoc_df %>%
+    rownames_to_column("comparison") %>%
+    separate(comparison, into = c("group1", "group2"), sep = "-") %>%
+    rename(p.adj = `p adj`, p.adj.signif = `p adj`)
+  test_used    <- "ANOVA + TukeyHSD"
+
+} else {
+  # Kruskal-Wallis + Dunn
+  kw_result  <- kruskal_test(GMWI2 ~ Population, data = df)
+  cat("\nUsing: Kruskal-Wallis\n")
+  print(kw_result)
+
+  dunn       <- dunn_test(df, GMWI2 ~ Population, p.adjust.method = "BH")
+  write_xlsx(dunn,
+             file.path(output_dir, paste0(prefix, "GMWI2_Kruskal_Dunn_BH.xlsx")))
+  pairwise_results <- dunn
+  test_used    <- "Kruskal-Wallis + Dunn (BH)"
+}
+
+cat("Test used:", test_used, "\n")
+```
+
+## 5. Annotated Boxplot with Significance
+
+```{r boxplot-sig, fig.width=8, fig.height=7}
+stat_sig <- pairwise_results %>%
+  filter(p.adj.signif != "ns")
+
+p_sig <- p_box +
+  stat_pvalue_manual(stat_sig,
+                     label       = "p.adj.signif",
+                     y.position  = max(df$GMWI2, na.rm = TRUE) * 1.05,
+                     step.increase = 0.08,
+                     tip.length  = 0.01,
+                     hide.ns     = TRUE)
+
+print(p_sig)
+ggsave(file.path(output_dir, paste0(prefix, "GMWI2_boxplot_by_population_sig.png")),
+       p_sig, width = 7, height = 7, dpi = 300)
+```
+
+## Session Info
+
+```{r session-info}
+cat("Output saved to:", output_dir, "\n")
+sessionInfo()
+```

@@ -1,0 +1,129 @@
+---
+title: "Differential Abundance Analysis for Pathway — LEfSe"
+author: "Vy Nguyen"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+params:
+  run_name:    "HGM_study"
+  output_dir:  "output"
+  lda_cutoff:  2.0
+  pval_cutoff: 0.05
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+library(phyloseq)
+library(microbiomeMarker)
+library(ggplot2)
+library(dplyr)
+library(readxl)
+library(writexl)
+library(tibble)
+library(here)
+
+run_name    <- params$run_name
+output_dir  <- params$output_dir
+lda_cutoff  <- params$lda_cutoff
+pval_cutoff <- params$pval_cutoff
+prefix      <- paste0(run_name, "_")
+
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+## 1. Load Data
+
+```{r load-data}
+# MetaCyc pathway abundance (CPM, unmapped removed)
+pathway_raw  <- read_excel(here("data", "pathway_abundance.xlsx"),
+                            sheet = "pathway_cpm")
+pathway_mat  <- as.matrix(pathway_raw[, -1])
+rownames(pathway_mat) <- pathway_raw[[1]]
+
+# Metadata
+metadata <- read_excel(here("data", "metadata.xlsx"), sheet = "metadata")
+metadata <- as.data.frame(metadata)
+rownames(metadata) <- metadata$SampleID
+
+# Align
+common_samples  <- intersect(colnames(pathway_mat), rownames(metadata))
+pathway_mat     <- pathway_mat[, common_samples]
+metadata        <- metadata[common_samples, ]
+metadata$Enterotype <- as.factor(metadata$Enterotype)
+
+cat("Pathways:", nrow(pathway_mat),
+    "| Samples:", ncol(pathway_mat), "\n")
+cat("Enterotype distribution:\n")
+print(table(metadata$Enterotype))
+```
+
+## 2. Build Phyloseq Object
+
+```{r phyloseq}
+ps_pathway <- phyloseq(
+  otu_table(pathway_mat, taxa_are_rows = TRUE),
+  sample_data(metadata)
+)
+
+# Filter: prevalence >= 10%
+ps_filtered <- filter_taxa(ps_pathway, function(x) {
+  sum(x > 0) / length(x) >= 0.10
+}, TRUE)
+
+cat("Pathways after prevalence filter:", ntaxa(ps_filtered), "\n")
+```
+
+## 3. LEfSe on Pathways
+
+```{r lefse-pathway, warning=FALSE}
+# Clean pathway names for microbiomeMarker compatibility
+ps_lefse     <- ps_filtered
+orig_names   <- taxa_names(ps_lefse)
+clean_names  <- gsub("[|\\[\\]\\.\\-: ]", "_", orig_names)
+taxa_names(ps_lefse) <- clean_names
+
+tax_mat <- matrix(taxa_names(ps_lefse), nrow = ntaxa(ps_lefse), ncol = 1)
+rownames(tax_mat) <- taxa_names(ps_lefse)
+colnames(tax_mat) <- "Pathway"
+tax_table(ps_lefse) <- tax_table(tax_mat)
+sample_data(ps_lefse)$Enterotype <- droplevels(
+  sample_data(ps_lefse)$Enterotype)
+
+lefse_result <- tryCatch(
+  run_lefse(ps_lefse, group = "Enterotype", taxa_rank = "Pathway",
+            wilcoxon_cutoff = pval_cutoff, lda_cutoff = lda_cutoff,
+            norm = "none"),
+  error = function(e) { cat("LEfSe error:", e$message, "\n"); NULL }
+)
+
+if (!is.null(lefse_result)) {
+  marker_tbl <- marker_table(lefse_result)
+  marker_tbl$p_adjust <- p.adjust(marker_tbl$pvalue, method = "fdr")
+
+  # Restore names
+  name_map <- setNames(orig_names, clean_names)
+  marker_tbl$feature <- name_map[marker_tbl$feature]
+
+  cat("LEfSe pathway markers:", nrow(marker_tbl), "\n")
+
+  p_bar <- tryCatch(plot_ef_bar(lefse_result), error = function(e) NULL)
+  if (!is.null(p_bar)) {
+    print(p_bar)
+    ggsave(file.path(output_dir, paste0(prefix, "pathway_LEfSe_barplot.png")),
+           p_bar, width = 10, height = max(6, nrow(marker_tbl) * 0.25), dpi = 300)
+  }
+
+  write_xlsx(list(
+    All_Markers = as.data.frame(marker_tbl)
+  ), file.path(output_dir, paste0(prefix, "pathway_LEfSe_results.xlsx")))
+}
+```
+
+## Session Info
+
+```{r session-info}
+cat("Output saved to:", output_dir, "\n")
+sessionInfo()
+```

@@ -1,0 +1,345 @@
+---
+title: "Alpha Diversity Analysis"
+author: "Vy Nguyen"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+params:
+  run_name: "HGM_study"
+  output_dir: "output"
+  group_var: "Enterotype"   # grouping variable in metadata (e.g. Enterotype, GMWI2Q, Gender)
+---
+
+```{r setup, include=TRUE, message=FALSE, warning=FALSE}
+library(vegan)
+library(phyloseq)
+library(ggplot2)
+library(dplyr)
+library(readxl)
+library(openxlsx)
+library(ggpubr)
+library(rstatix)
+library(multcomp)
+library(agricolae)
+library(gridExtra)
+library(here)
+
+run_name   <- params$run_name
+output_dir <- params$output_dir
+group_var  <- params$group_var
+prefix     <- paste0(run_name, "_")
+
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+
+custom_theme <- theme_minimal() +
+  theme(
+    plot.title      = element_text(size = 14, face = "bold", hjust = 0.5),
+    axis.title      = element_text(size = 12),
+    axis.text       = element_text(size = 10),
+    legend.position = "bottom",
+    panel.grid.minor = element_blank()
+  )
+```
+
+## 1. Load Data
+
+```{r load-data, message=FALSE, warning=FALSE}
+# Species count table (rows: species, columns: samples)
+otu_raw <- read_excel(here("data", "species_abundance.xlsx"), sheet = "species_counts_transposed")
+otu_table <- as.data.frame(otu_raw)
+rownames(otu_table) <- otu_table[, 1]
+otu_table <- otu_table[, -1]
+
+# Transpose if needed: rows = samples, columns = species
+# otu_table <- t(otu_table)
+
+# Metadata
+metadata <- read_excel(here("data", "metadata.xlsx"), sheet = "metadata")
+metadata <- as.data.frame(metadata)
+
+# Align samples
+common_samples <- intersect(rownames(otu_table), metadata$SampleID)
+cat("OTU table samples:", nrow(otu_table), "\n")
+cat("Metadata samples:", nrow(metadata), "\n")
+cat("Common samples:", length(common_samples), "\n\n")
+
+otu_table <- otu_table[common_samples, ]
+metadata  <- metadata[match(common_samples, metadata$SampleID), ]
+
+cat("OTU table dimensions:", dim(otu_table), "\n")
+cat("Metadata dimensions:", dim(metadata), "\n")
+```
+
+## 2. Compute Alpha Diversity Indices
+
+```{r compute-indices}
+observed   <- rowSums(otu_table > 0)
+shannon    <- diversity(otu_table, index = "shannon")
+evenness   <- shannon / log(observed)
+chao1      <- apply(otu_table, 1, function(x) estimateR(x)["S.chao1"])
+
+alpha_df <- data.frame(
+  SampleID   = rownames(otu_table),
+  Observed   = observed,
+  Shannon    = shannon,
+  Evenness   = evenness,
+  Chao1      = chao1
+)
+alpha_df <- merge(alpha_df, metadata, by = "SampleID")
+
+# Summary statistics helper
+summary_funcs <- list(
+  Mean     = ~mean(., na.rm = TRUE),
+  SD       = ~sd(., na.rm = TRUE),
+  SE       = ~sd(., na.rm = TRUE) / sqrt(sum(!is.na(.))),
+  CI_Lower = ~mean(., na.rm = TRUE) - qt(0.975, sum(!is.na(.)) - 1) *
+               (sd(., na.rm = TRUE) / sqrt(sum(!is.na(.)))),
+  CI_Upper = ~mean(., na.rm = TRUE) + qt(0.975, sum(!is.na(.)) - 1) *
+               (sd(., na.rm = TRUE) / sqrt(sum(!is.na(.)))),
+  Median   = ~median(., na.rm = TRUE),
+  Min      = ~min(., na.rm = TRUE),
+  Max      = ~max(., na.rm = TRUE)
+)
+
+metrics <- c("Observed", "Shannon", "Evenness", "Chao1")
+
+summary_group <- alpha_df %>%
+  group_by(!!sym(group_var)) %>%
+  summarise(n = n(),
+            across(all_of(metrics), summary_funcs, .names = "{.col}_{.fn}"),
+            .groups = "drop")
+
+summary_total <- alpha_df %>%
+  summarise(!!sym(group_var) := "Total",
+            n = n(),
+            across(all_of(metrics), summary_funcs, .names = "{.col}_{.fn}"))
+
+final_summary <- bind_rows(summary_group, summary_total)
+
+# Export
+wb <- createWorkbook()
+addWorksheet(wb, "Individual_Samples")
+writeData(wb, "Individual_Samples", alpha_df)
+addWorksheet(wb, "Summary_Statistics")
+writeData(wb, "Summary_Statistics", final_summary)
+saveWorkbook(wb,
+             file.path(output_dir, paste0(prefix, "alpha_diversity_indices.xlsx")),
+             overwrite = TRUE)
+
+knitr::kable(head(alpha_df), caption = "Alpha Diversity Indices (first 6 rows)")
+```
+
+## 3. Statistical Testing
+
+```{r statistical-tests, warning=FALSE}
+perform_statistical_tests <- function(df, metric, group_var) {
+
+  formula_str <- as.formula(paste(metric, "~", group_var))
+  groups      <- unique(df[[group_var]])
+  n_groups    <- length(groups)
+
+  cat("\n", strrep("=", 60), "\n")
+  cat("METRIC:", metric, "\n")
+  cat(strrep("=", 60), "\n\n")
+
+  # Normality (Shapiro-Wilk)
+  normality <- df %>%
+    group_by(!!sym(group_var)) %>%
+    summarise(n       = n(),
+              W       = shapiro.test(.data[[metric]])$statistic,
+              p_value = shapiro.test(.data[[metric]])$p.value,
+              Normal  = ifelse(p_value > 0.05, "Yes", "No"),
+              .groups = "drop")
+  print(knitr::kable(normality, digits = 4, caption = "Shapiro-Wilk normality test"))
+  all_normal <- all(normality$p_value > 0.05)
+
+  # Homogeneity of variance (Levene)
+  homogeneous <- TRUE
+  if (n_groups >= 2) {
+    levene      <- df %>% levene_test(formula_str)
+    homogeneous <- levene$p > 0.05
+    cat("Levene's test: F =", round(levene$statistic, 4),
+        ", p =", round(levene$p, 4),
+        ifelse(homogeneous, " (homogeneous)\n", " (heterogeneous)\n"))
+  }
+
+  # Select test
+  result <- list()
+
+  if (n_groups == 2) {
+    if (all_normal && homogeneous) {
+      test <- t.test(formula_str, data = df, var.equal = TRUE)
+      result <- list(method = "Independent t-test", test_type = "parametric",
+                     statistic = test$statistic, p_value = test$p.value)
+    } else {
+      test <- wilcox.test(formula_str, data = df)
+      result <- list(method = "Wilcoxon rank-sum test", test_type = "non-parametric",
+                     statistic = test$statistic, p_value = test$p.value)
+    }
+    result$post_hoc <- NULL
+
+  } else {
+    if (all_normal && homogeneous) {
+      aov_fit <- aov(formula_str, data = df)
+      aov_sum <- summary(aov_fit)
+      result  <- list(method = "One-way ANOVA", test_type = "parametric",
+                      statistic = aov_sum[[1]]$`F value`[1],
+                      p_value   = aov_sum[[1]]$`Pr(>F)`[1])
+      if (result$p_value < 0.05) {
+        tukey  <- TukeyHSD(aov_fit)
+        hsd    <- HSD.test(aov_fit, group_var)
+        result$post_hoc        <- hsd$groups
+        result$post_hoc_method <- "Tukey HSD"
+      }
+    } else {
+      kw <- kruskal.test(formula_str, data = df)
+      result <- list(method = "Kruskal-Wallis test", test_type = "non-parametric",
+                     statistic = kw$statistic, p_value = kw$p.value)
+      if (result$p_value < 0.05) {
+        ph <- df %>% pairwise_wilcox_test(formula_str, p.adjust.method = "BH")
+        result$post_hoc        <- ph
+        result$post_hoc_method <- "Pairwise Wilcoxon (BH correction)"
+      }
+    }
+  }
+
+  result$significant        <- result$p_value < 0.05
+  result$significance_level <- ifelse(result$p_value < 0.001, "***",
+                               ifelse(result$p_value < 0.01,  "**",
+                               ifelse(result$p_value < 0.05,  "*", "ns")))
+
+  cat("Result:", ifelse(result$significant, "SIGNIFICANT", "not significant"),
+      " | p =", round(result$p_value, 4),
+      result$significance_level, "\n")
+
+  return(result)
+}
+
+all_test_results <- lapply(setNames(metrics, metrics),
+                           perform_statistical_tests,
+                           df = alpha_df, group_var = group_var)
+```
+
+## 4. Summary of Statistical Tests
+
+```{r summary-table}
+stat_summary <- bind_rows(lapply(metrics, function(m) {
+  r <- all_test_results[[m]]
+  data.frame(
+    Metric      = m,
+    Test_Method = r$method,
+    Test_Type   = r$test_type,
+    Statistic   = round(r$statistic, 4),
+    P_value     = round(r$p_value, 4),
+    Significance = r$significance_level,
+    Post_hoc    = ifelse(is.null(r$post_hoc), "None", r$post_hoc_method),
+    stringsAsFactors = FALSE
+  )
+}))
+
+write.xlsx(stat_summary,
+           file.path(output_dir, paste0(prefix, "alpha_diversity_stats_summary.xlsx")),
+           rowNames = FALSE)
+
+knitr::kable(stat_summary, caption = "Statistical Test Summary")
+```
+
+## 5. Boxplots with Statistical Annotations
+
+```{r boxplots, fig.width=8, fig.height=6, warning=FALSE}
+plot_alpha <- function(df, metric, group_var) {
+  r <- all_test_results[[metric]]
+
+  p <- ggplot(df, aes(x = .data[[group_var]], y = .data[[metric]],
+                      fill = .data[[group_var]])) +
+    geom_boxplot(alpha = 0.7, outlier.shape = NA) +
+    geom_jitter(width = 0.2, alpha = 0.5, size = 2) +
+    scale_fill_brewer(palette = "Set2") +
+    custom_theme +
+    labs(title = paste("Alpha Diversity —", metric),
+         x = group_var, y = metric) +
+    theme(legend.position = "none") +
+    stat_compare_means(
+      method     = ifelse(r$test_type == "parametric", "anova", "kruskal.test"),
+      label      = "p.format",
+      label.x.npc = 0.95,
+      label.y.npc = 0.95,
+      hjust = 1, size = 5
+    )
+
+  ggsave(file.path(output_dir, paste0(prefix, "alpha_", metric, "_boxplot.png")),
+         p, width = 7, height = 5, dpi = 300)
+  return(p)
+}
+
+plot_list <- lapply(metrics, plot_alpha, df = alpha_df, group_var = group_var)
+for (p in plot_list) print(p)
+```
+
+## 6. Combined Plot
+
+```{r combined-plot, fig.width=14, fig.height=10}
+combined <- grid.arrange(grobs = plot_list, ncol = 3)
+ggsave(file.path(output_dir, paste0(prefix, "alpha_diversity_combined.png")),
+       combined, width = 14, height = 10, dpi = 300)
+```
+
+## 7. Rarefaction Curves
+
+```{r rarefaction, fig.width=10, fig.height=7}
+otu_matrix <- round(as.matrix(otu_table))
+
+color_mapping  <- setNames(rainbow(length(unique(alpha_df[[group_var]]))),
+                           unique(alpha_df[[group_var]]))
+sample_colors  <- color_mapping[alpha_df[[group_var]][
+                    match(rownames(otu_matrix), alpha_df$SampleID)]]
+
+rarecurve(otu_matrix, step = 50,
+          sample = min(rowSums(otu_matrix)),
+          col = sample_colors, label = FALSE,
+          xlab = "Sequencing Depth", ylab = "Number of Species",
+          main = "Rarefaction Curves")
+legend("bottomright", legend = names(color_mapping),
+       col = color_mapping, lty = 1, lwd = 2, cex = 0.8)
+
+png(file.path(output_dir, paste0(prefix, "rarefaction_curves.png")),
+    width = 1000, height = 700, res = 120)
+rarecurve(otu_matrix, step = 50,
+          sample = min(rowSums(otu_matrix)),
+          col = sample_colors, label = FALSE,
+          xlab = "Sequencing Depth", ylab = "Number of Species",
+          main = "Rarefaction Curves")
+legend("bottomright", legend = names(color_mapping),
+       col = color_mapping, lty = 1, lwd = 2, cex = 0.8)
+dev.off()
+```
+
+## 8. Post-hoc Results
+
+```{r posthoc-details}
+posthoc_list <- list()
+
+for (metric in metrics) {
+  r <- all_test_results[[metric]]
+  if (!is.null(r$post_hoc) && r$significant) {
+    cat("\n###", metric, "— Post-hoc:", r$post_hoc_method, "\n")
+    print(knitr::kable(as.data.frame(r$post_hoc), digits = 4))
+    posthoc_list[[metric]] <- as.data.frame(r$post_hoc)
+  }
+}
+
+if (length(posthoc_list) > 0) {
+  write.xlsx(posthoc_list,
+             file.path(output_dir, paste0(prefix, "alpha_diversity_posthoc.xlsx")))
+}
+```
+
+## Session Info
+
+```{r session-info}
+cat("Output saved to:", output_dir, "\n")
+sessionInfo()
+```

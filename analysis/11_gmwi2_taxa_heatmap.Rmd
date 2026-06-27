@@ -1,0 +1,163 @@
+---
+title: "GMWI2 Taxa Prevalence Heatmap — Cross-Population"
+author: "Vy Nguyen"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+params:
+  run_name:         "HGM_study"
+  output_dir:       "output"
+  top_n:            50           # number of top taxa to display
+  core_cutoff:      0            # minimum prevalence in reference population
+  this_study_label: "This study" # substring to identify reference population column
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(openxlsx)
+library(here)
+
+run_name          <- params$run_name
+output_dir        <- params$output_dir
+top_n             <- params$top_n
+core_cutoff       <- params$core_cutoff
+this_study_label  <- params$this_study_label
+prefix            <- paste0(run_name, "_")
+
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+## 1. Load Data
+
+```{r load-data}
+# GMWI2 scores file: rows = taxa, columns = populations (prevalence values)
+df <- read_excel(here("data", "gmwi2_scores.xlsx"), sheet = "gmwi2_taxa")
+
+names(df) <- trimws(names(df))
+pop_cols  <- setdiff(names(df), "Taxa")
+
+# Identify reference population column
+ref_col <- grep(this_study_label, pop_cols, value = TRUE,
+                ignore.case = TRUE)[1]
+if (is.na(ref_col)) stop("Reference population column not found.")
+
+cat("Populations:", paste(pop_cols, collapse = ", "), "\n")
+cat("Reference column:", ref_col, "\n")
+cat("Taxa:", nrow(df), "\n")
+
+# Coerce all population columns to numeric
+df <- df %>%
+  mutate(across(all_of(pop_cols), as.numeric)) %>%
+  mutate(TotalPrev = rowSums(across(all_of(pop_cols)), na.rm = TRUE))
+```
+
+## 2. Select Top Taxa
+
+```{r select-taxa}
+# Taxa present in reference population
+core_ref   <- df %>% filter(.data[[ref_col]] >= core_cutoff)
+
+# Additional taxa from other populations (not already in core_ref)
+other_core <- df %>%
+  filter(if_any(all_of(setdiff(pop_cols, ref_col)), ~ .x >= core_cutoff)) %>%
+  filter(!Taxa %in% core_ref$Taxa) %>%
+  arrange(desc(TotalPrev))
+
+df_top <- bind_rows(core_ref,
+                    head(other_core, max(0, top_n - nrow(core_ref))))
+
+cat("Taxa from reference population:", nrow(core_ref), "\n")
+cat("Additional taxa from other cohorts:", nrow(df_top) - nrow(core_ref), "\n")
+cat("Total taxa in heatmap:", nrow(df_top), "\n")
+
+# Save summary Excel
+wb <- createWorkbook()
+addWorksheet(wb, "Top_taxa")
+writeData(wb, "Top_taxa", df_top)
+addWorksheet(wb, "All_taxa_sorted")
+writeData(wb, "All_taxa_sorted", df %>% arrange(desc(TotalPrev)))
+saveWorkbook(wb,
+             file.path(output_dir, paste0(prefix, "GMWI2_taxa_summary.xlsx")),
+             overwrite = TRUE)
+```
+
+## 3. Heatmap
+
+```{r heatmap, fig.width=9, fig.height=17}
+# Tidy format for ggplot
+ordered_pops <- c(ref_col, setdiff(pop_cols, ref_col))
+
+df_long <- df_top %>%
+  pivot_longer(cols = all_of(pop_cols),
+               names_to  = "Population",
+               values_to = "Prevalence") %>%
+  mutate(Population = factor(Population, levels = ordered_pops))
+
+# Order taxa by prevalence in reference population (descending)
+taxa_order <- df_long %>%
+  filter(Population == ref_col) %>%
+  arrange(desc(Prevalence)) %>%
+  pull(Taxa)
+
+df_long$Taxa <- factor(df_long$Taxa, levels = rev(taxa_order))
+
+# Set color scale
+fill_var <- "Prevalence"
+fill_label <- "Prevalence (0–1)"
+scale_layer <- scale_fill_gradientn(
+  colours = c("#f7fcf5", "#c7e9c0", "#74c476", "#238b45", "#00441b"),
+  limits = c(0,1),
+  name = fill_label)
+
+# Plot heatmap
+p <- ggplot(df_long, aes(x = Population, y = Taxa, fill = .data[[fill_var]])) +
+  #geom_tile(color = "white", linewidth = 0.25, width = 0.75, height = 0.8) +
+  geom_tile(color = NA, width = 1, height = 1)+
+  scale_layer +
+  labs(
+    title = paste0("GMWI2 Taxa Prevalence Across Populations (Top ", top_n, ")"),
+    subtitle = paste("Reference:", ref_col),
+    x = "Population", y = "Taxa"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    axis.text.x = element_text(angle = 40, hjust = 1, vjust = 1, size = 11),
+    axis.text.y = element_text(face = "italic", size = 9, lineheight = 0.9),
+    legend.position = "right",
+    legend.key.height = unit(0.8, "cm"),
+    legend.key.width  = unit(0.4, "cm"),
+    legend.text = element_text(size = 9),
+    legend.title = element_text(size = 10, face = "bold"),
+    plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = 11, face = "italic", hjust = 0.5)
+  )
+
+print(p)
+
+ggsave(file.path(output_dir,
+                 paste0(prefix, "GMWI2_taxa_heatmap_top", top_n, ".png")),
+       p, width = 9, height = 17, dpi = 300)
+
+cat("Heatmap saved.\n")
+```
+
+## 4. Summary Table
+
+```{r summary-table}
+knitr::kable(df_top[, c("Taxa", pop_cols)],
+             digits  = 3,
+             caption = paste("Top", top_n, "GMWI2 Taxa — Prevalence by Population"))
+```
+
+## Session Info
+
+```{r session-info}
+cat("Output saved to:", output_dir, "\n")
+sessionInfo()
+```
