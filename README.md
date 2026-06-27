@@ -45,11 +45,11 @@ Sample input data files (place in `data/` directory):
 
 | File | Description | Sheet(s) used |
 |------|-------------|---------------|
-| `species_abundance.xlsx` | MetaPhlAn3 species-level profiles | `species_relabund`, `species_counts`, `species_counts_transpose` |
+| `species_abundance.xlsx` | MetaPhlAn3 species-level profiles | `species_relabund`, `species_counts`, `species_counts_transposed` |
 | `metadata.xlsx` | Sample metadata (anonymized) | `metadata` |
 | `pathway_abundance.xlsx` | HUMAnN3 MetaCyc pathway abundance (CPM) | `pathway_cpm` |
 | `gmwi2_scores.xlsx` | GMWI2 scores across populations | `gmwi2`, `gmwi2_taxa` |
-| `hack_taxa_list.xlsx` | HACK taxa reference list | Sheet 1 |
+| `hack_taxa_list.xlsx` | HACK taxa reference list | `hack_taxa_list` |
 
 > **Note**: Raw sequencing data are not included in this repository.
 
